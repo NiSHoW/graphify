@@ -304,19 +304,53 @@ def test_save_delta_shape(fake_neo4j):
     assert "coalesce(m.version, 0) + 1" in tx_queries[-1]
 
 
-def test_save_chunks_large_row_sets(fake_neo4j):
-    log, _results = fake_neo4j
-    data = {
+def _big_data(n=2500):
+    return {
         "nodes": [{"id": f"n{i}", "label": f"x{i}", "file_type": "code"}
-                  for i in range(2500)],
+                  for i in range(n)],
         "links": [], "hyperedges": [], "graph": {},
     }
+
+
+def test_save_chunks_large_row_sets(fake_neo4j, monkeypatch):
+    monkeypatch.delenv("GRAPHIFY_NEO4J_TX_ROWS", raising=False)
+    log, _results = fake_neo4j
     b = _open()
-    b.save_graph_data(data, prior=None)
+    b.save_graph_data(_big_data(), prior=None)
     node_batches = [p for k, q, p in log
                     if k == "tx" and "MERGE (n:GraphifyNode" in q]
     assert len(node_batches) == 3  # 2500 rows / 1000 per chunk
     assert all(len(p["rows"]) <= 1000 for p in node_batches)
+    kinds = [k for k, _, _ in log]
+    assert kinds.count("begin_tx") == 1, "default stays fully atomic"
+
+
+def test_save_chunked_transactions_opt_in(fake_neo4j, monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_NEO4J_TX_ROWS", "1000")
+    log, _results = fake_neo4j
+    b = _open()
+    b.save_graph_data(_big_data(), prior=None)
+    kinds = [k for k, _, _ in log]
+    assert kinds.count("begin_tx") == 3, "commits every ~1000 rows"
+    assert kinds.count("commit") == 3
+    # the version bump must still be the last statement of the LAST transaction
+    tx_queries = [q for k, q, _ in log if k == "tx"]
+    assert "coalesce(m.version, 0) + 1" in tx_queries[-1]
+    last_begin = max(i for i, k in enumerate(kinds) if k == "begin_tx")
+    meta_idx = max(i for i, (k, q, _) in enumerate(log) if k == "tx" and "GraphifyMeta" in q)
+    assert meta_idx > last_begin, "meta bump lives in the final transaction"
+
+
+def test_save_progress_output(fake_neo4j, monkeypatch, capsys):
+    monkeypatch.delenv("GRAPHIFY_NEO4J_TX_ROWS", raising=False)
+    b = _open()
+    b.save_graph_data(_big_data(), prior=None)
+    err = capsys.readouterr().err
+    assert "pushing 2_500 rows to branch 'main' (atomic)" in err
+    assert "2_500/2_500 rows (100%)" in err
+    # small pushes stay silent
+    b.save_graph_data(_sample_data(), prior=None)
+    assert "pushing" not in capsys.readouterr().err
 
 
 def test_ensure_schema_statements(fake_neo4j):
@@ -636,6 +670,29 @@ def test_sync_external_change_rematerializes(sync_env):
     refreshed = json.loads((out / "graph.json").read_text(encoding="utf-8"))
     assert {n["id"] for n in refreshed["nodes"]} == {"n1", "n2"}
     assert (out / ".gitignore").exists(), "materialize drops the self-ignore file"
+
+
+def test_sync_hard_kill_mid_push_leaves_dirty_state(sync_env):
+    # Ctrl+C / OOM raise BaseException, which push()'s `except Exception`
+    # never sees: the dirty mark written BEFORE the attempt is the only trace.
+    out, fb = sync_env
+    fb.version = 2
+    fb.data = _sample_data()
+    _local_graph(out, _sample_data())
+    from graphify.backends import BackendSync, load_backend_state, save_backend_state
+    save_backend_state(out, version=2)
+    sync = BackendSync(out)
+    assert sync.prepare() is True
+
+    def kill(data, *, prior=None):
+        raise KeyboardInterrupt
+
+    fb.save_graph_data = kill
+    sync._force_push = True  # ensure the push is attempted
+    with pytest.raises(KeyboardInterrupt):
+        sync.push(changed=True)
+    state = load_backend_state(out)
+    assert state.get("dirty") is True and state["version"] == 2
 
 
 def test_sync_push_failure_marks_dirty_then_recovers(sync_env, capsys):

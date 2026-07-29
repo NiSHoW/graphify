@@ -368,6 +368,19 @@ class BackendSync:
         import sys
         if not changed and self.prior is not None and not self._force_push:
             return  # local == DB already; nothing to push
+        # Mark dirty BEFORE the attempt, not just in the failure handler: a
+        # hard kill mid-push (Ctrl+C, OOM — BaseException, which the except
+        # below never sees) must still leave a trace, or the next run would
+        # trust its "in sync" state and diff against a local file the DB never
+        # received. push_after_write rewrites a clean state on success. This
+        # is also what makes chunked transactions (GRAPHIFY_NEO4J_TX_ROWS)
+        # crash-safe: a partially written branch gets repaired by the next
+        # run's delta against the DB's real content.
+        prev_state = load_backend_state(self.out)
+        try:
+            save_backend_state(self.out, version=prev_state.get("version"), dirty=True)
+        except OSError:
+            pass
         try:
             counts = push_after_write(self.out, self.backend, prior=self.prior)
             branch = getattr(self.backend, "branch", "?")

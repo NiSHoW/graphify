@@ -23,7 +23,9 @@ cache on the version can never observe a torn graph.
 from __future__ import annotations
 
 import json
+import os
 import re
+import sys
 from datetime import datetime, timezone
 
 SCHEMA_VERSION = 1
@@ -204,6 +206,52 @@ def _chunks(rows: list, size: int = _CHUNK):
         yield rows[i:i + size]
 
 
+# Pushes below this many rows stay silent — a routine incremental delta must
+# not add noise to every `graphify update`.
+_PROGRESS_MIN_ROWS = 2000
+
+
+class _PushProgress:
+    """Progress reporting for large pushes, on stderr.
+
+    On a TTY the same line is rewritten in place (``\\r``); otherwise (hooks,
+    CI logs) a plain line is emitted every ~10k rows so the log still shows
+    the push is alive without flooding it.
+    """
+
+    def __init__(self, total_rows: int, *, branch: str, mode: str):
+        self.total = total_rows
+        self.done = 0
+        self._last_logged = 0
+        self.enabled = total_rows >= _PROGRESS_MIN_ROWS
+        self._tty = self.enabled and sys.stderr.isatty()
+        if self.enabled:
+            print(f"[graphify] Neo4j: pushing {total_rows:_d} rows to branch "
+                  f"{branch!r} ({mode})...", file=sys.stderr, flush=True)
+
+    def _line(self) -> str:
+        pct = self.done * 100 // self.total if self.total else 100
+        return f"[graphify] Neo4j push: {self.done:_d}/{self.total:_d} rows ({pct}%)"
+
+    def advance(self, nrows: int) -> None:
+        if not self.enabled or not nrows:
+            return
+        self.done += nrows
+        if self._tty:
+            print("\r" + self._line(), end="", file=sys.stderr, flush=True)
+        elif self.done - self._last_logged >= 10_000:
+            self._last_logged = self.done
+            print(self._line(), file=sys.stderr, flush=True)
+
+    def finish(self) -> None:
+        if not self.enabled:
+            return
+        if self._tty:
+            print("\r" + self._line(), file=sys.stderr, flush=True)
+        elif self.done != self._last_logged:
+            print(self._line(), file=sys.stderr, flush=True)
+
+
 class Neo4jBackend:
     """Branch-scoped Neo4j storage for a graphify graph."""
 
@@ -286,6 +334,9 @@ class Neo4jBackend:
                     f"exceeds the {cap_nodes:_d}-node cap (derived from the graph "
                     f"byte cap; set GRAPHIFY_MAX_GRAPH_BYTES to raise it)"
                 )
+            if node_count >= _PROGRESS_MIN_ROWS:
+                print(f"[graphify] Neo4j: loading {node_count:_d} nodes from "
+                      f"branch {self.branch!r}...", file=sys.stderr, flush=True)
             node_recs = [dict(r["p"]) for r in session.run(
                 "MATCH (n:GraphifyNode {branch: $branch}) RETURN properties(n) AS p",
                 branch=self.branch,
@@ -305,11 +356,23 @@ class Neo4jBackend:
 
     # -- write -------------------------------------------------------------
     def save_graph_data(self, data: dict, *, prior: dict | None = None) -> dict[str, int]:
-        """Persist ``data`` for this branch in ONE transaction.
+        """Persist ``data`` for this branch.
 
         ``prior=None`` -> authoritative full replace (delete branch + insert).
         ``prior=dict`` -> minimal delta computed dict-vs-dict.
-        The meta version bump is the last statement of the transaction.
+
+        By default everything runs in ONE transaction. Set
+        ``GRAPHIFY_NEO4J_TX_ROWS=<n>`` to commit every ~n rows instead — easier
+        on the Neo4j heap for very large seeds. Reader consistency does not
+        depend on the single transaction: the ``GraphifyMeta.version`` bump is
+        ALWAYS the last statement of the last transaction, and version-keyed
+        readers (the MCP server) reload only on a version change. The chunked
+        mode's residual risk — a crash leaving the branch partially written —
+        is covered by the caller (``BackendSync``) marking its sync state
+        dirty before the push, so the next run diffs against the DB's real
+        content and repairs it.
+
+        Pushes bigger than ~2000 rows report progress on stderr.
         """
         branch = self.branch
         if prior is None:
@@ -357,53 +420,76 @@ class Neo4jBackend:
             "built_at_commit": data.get("built_at_commit") or "",
         }
 
+        # Assemble every statement as (query, params, row_count) so the
+        # executor below can run them atomically or in chunked transactions
+        # and report progress either way. Removals come first (explicit edge
+        # deletes, then DETACH DELETE of removed nodes), then node upserts
+        # (so the edge MATCHes can bind), then edge upserts.
+        ops: list[tuple[str, dict, int]] = []
+        if delta is None:
+            ops.append((
+                "MATCH (n:GraphifyNode {branch: $branch}) DETACH DELETE n",
+                {"branch": branch}, 0,
+            ))
+        else:
+            for rel, rows in edge_removals.items():
+                for chunk in _chunks(rows):
+                    ops.append((
+                        "UNWIND $rows AS row "
+                        "MATCH (a:GraphifyNode {uid: row.src})"
+                        f"-[r:{rel}]->"
+                        "(b:GraphifyNode {uid: row.tgt}) DELETE r",
+                        {"rows": chunk}, len(chunk),
+                    ))
+            if nodes_removed:
+                uids = [node_uid(branch, nid) for nid in nodes_removed]
+                for chunk in _chunks(uids):
+                    ops.append((
+                        "UNWIND $uids AS uid "
+                        "MATCH (n:GraphifyNode {uid: uid}) DETACH DELETE n",
+                        {"uids": chunk}, len(chunk),
+                    ))
+        for label, rows in node_groups.items():
+            for chunk in _chunks(rows):
+                ops.append((
+                    "UNWIND $rows AS row "
+                    "MERGE (n:GraphifyNode {uid: row.uid}) "
+                    f"SET n = row.props SET n:{label}",
+                    {"rows": chunk}, len(chunk),
+                ))
+        for rel, rows in edge_groups.items():
+            for chunk in _chunks(rows):
+                ops.append((
+                    "UNWIND $rows AS row "
+                    "MATCH (a:GraphifyNode {uid: row.src}), "
+                    "(b:GraphifyNode {uid: row.tgt}) "
+                    f"MERGE (a)-[r:{rel}]->(b) SET r = row.props",
+                    {"rows": chunk}, len(chunk),
+                ))
+
+        try:
+            tx_rows = int(os.environ.get("GRAPHIFY_NEO4J_TX_ROWS", "0") or 0)
+        except ValueError:
+            tx_rows = 0
+        total_rows = sum(n for _, _, n in ops)
+        progress = _PushProgress(total_rows, branch=branch,
+                                 mode=f"chunks of {tx_rows}" if tx_rows > 0 else "atomic")
+
         with self._session() as session:
-            with session.begin_transaction() as tx:
-                if delta is None:
-                    tx.run(
-                        "MATCH (n:GraphifyNode {branch: $branch}) DETACH DELETE n",
-                        branch=branch,
-                    )
-                else:
-                    # Removals first: explicit edge deletes, then DETACH DELETE
-                    # of removed nodes (which drops their remaining edges).
-                    for rel, rows in edge_removals.items():
-                        for chunk in _chunks(rows):
-                            tx.run(
-                                "UNWIND $rows AS row "
-                                "MATCH (a:GraphifyNode {uid: row.src})"
-                                f"-[r:{rel}]->"
-                                "(b:GraphifyNode {uid: row.tgt}) DELETE r",
-                                rows=chunk,
-                            )
-                    if nodes_removed:
-                        uids = [node_uid(branch, nid) for nid in nodes_removed]
-                        for chunk in _chunks(uids):
-                            tx.run(
-                                "UNWIND $uids AS uid "
-                                "MATCH (n:GraphifyNode {uid: uid}) DETACH DELETE n",
-                                uids=chunk,
-                            )
-                for label, rows in node_groups.items():
-                    for chunk in _chunks(rows):
-                        tx.run(
-                            "UNWIND $rows AS row "
-                            "MERGE (n:GraphifyNode {uid: row.uid}) "
-                            f"SET n = row.props SET n:{label}",
-                            rows=chunk,
-                        )
-                for rel, rows in edge_groups.items():
-                    for chunk in _chunks(rows):
-                        tx.run(
-                            "UNWIND $rows AS row "
-                            "MATCH (a:GraphifyNode {uid: row.src}), "
-                            "(b:GraphifyNode {uid: row.tgt}) "
-                            f"MERGE (a)-[r:{rel}]->(b) SET r = row.props",
-                            rows=chunk,
-                        )
-                # Version bump LAST: readers keyed on version never see a torn
-                # graph, because nothing above is visible until this commits and
-                # the version only moves once everything above is in the tx.
+            tx = session.begin_transaction()
+            rows_in_tx = 0
+            try:
+                for query, params, nrows in ops:
+                    tx.run(query, **params)
+                    rows_in_tx += nrows
+                    progress.advance(nrows)
+                    if tx_rows > 0 and rows_in_tx >= tx_rows:
+                        tx.commit()
+                        tx = session.begin_transaction()
+                        rows_in_tx = 0
+                # Version bump LAST — always in the FINAL transaction, so a
+                # version-keyed reader reloads only once everything above is
+                # committed, in both atomic and chunked modes.
                 tx.run(
                     "MERGE (m:GraphifyMeta {branch: $branch}) "
                     "SET m += $props, m.version = coalesce(m.version, 0) + 1",
@@ -411,6 +497,8 @@ class Neo4jBackend:
                     props=meta_props,
                 )
                 tx.commit()
+            finally:
+                progress.finish()
         return counts
 
     # -- branches ----------------------------------------------------------
