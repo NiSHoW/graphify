@@ -543,6 +543,7 @@ def _run_cli() -> None:
         print("    --user U                Neo4j user (default neo4j); password via NEO4J_PASSWORD env")
         print("    --database D            Neo4j database (default neo4j, or from the URI path)")
         print("  backend pull            materialize the current branch's graph from Neo4j into graphify-out/graph.json (no extraction)")
+        print("  backend push            push the local graph.json cache to Neo4j (delta; for flows that wrote graph.json outside `graphify update`)")
         print("  backend show|unset      show or remove the Neo4j backend config (backend.json)")
         print("  branches                list per-branch graphs stored in the Neo4j backend")
         print("    --delete <name>         delete one branch's graph from the backend")

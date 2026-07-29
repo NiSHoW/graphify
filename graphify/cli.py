@@ -2087,8 +2087,43 @@ def dispatch_command(cmd: str) -> None:
                 sys.exit(1)
             finally:
                 b.close()
+        elif sub == "push":
+            # Counterpart of pull: push the local graph.json cache to Neo4j as
+            # a delta against the DB's current content. The closing step for
+            # flows that write graph.json OUTSIDE `graphify update` (e.g. the
+            # skill's manual semantic-extraction runbook), which would
+            # otherwise leave the database silently behind the local cache.
+            cfg = backend_config(out_dir)
+            if cfg is None:
+                print("error: no Neo4j backend configured (run: graphify backend set <uri>)", file=sys.stderr)
+                sys.exit(1)
+            graph_file = out_dir / "graph.json"
+            if not graph_file.exists():
+                print(f"error: {graph_file} not found — nothing to push", file=sys.stderr)
+                sys.exit(1)
+            from graphify.backends import push_after_write
+            try:
+                b = open_backend(cfg)
+            except (ImportError, ValueError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                prior = b.load_graph_data()  # None => branch never written: full seed
+                counts = push_after_write(out_dir, b, prior=prior)
+                if prior is None:
+                    print(f"Seeded branch {b.branch!r} with {counts['nodes']} nodes / "
+                          f"{counts['edges']} edges.")
+                else:
+                    print(f"Branch {b.branch!r} updated "
+                          f"(+{counts['nodes_upserted']} nodes, +{counts['edges_upserted']} edges, "
+                          f"-{counts['nodes_removed']} nodes, -{counts['edges_removed']} edges).")
+            except Exception as exc:
+                print(f"error: could not push to Neo4j: {exc}", file=sys.stderr)
+                sys.exit(1)
+            finally:
+                b.close()
         else:
-            print("Usage: graphify backend <set|show|unset|pull>", file=sys.stderr)
+            print("Usage: graphify backend <set|show|unset|pull|push>", file=sys.stderr)
             sys.exit(2)
 
     elif cmd == "branches":
