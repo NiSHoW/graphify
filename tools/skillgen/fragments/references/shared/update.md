@@ -6,6 +6,18 @@ Load this only when the user passed `--update` or `--cluster-only`. A first-time
 
 Use when you've added or modified files since the last run. Only re-extracts changed files - saves tokens and time.
 
+**Try the CLI first — it covers the common case end-to-end.** Run:
+
+```bash
+graphify update INPUT_PATH
+```
+
+This single command detects the changed files, re-extracts code via AST (no LLM), reconciles with the existing graph, re-clusters, regenerates the report — and, when a Neo4j backend is configured (`graphify-out/backend.json`), pushes the delta to the database. If it succeeds and its output does not mention pending doc/paper/image changes, you are **done**: do not run any of the manual steps below.
+
+Fall back to the manual runbook below ONLY when non-code files (docs, PDFs, images) changed and need semantic re-extraction you must dispatch via subagents — the CLI tells you (`For doc/paper/image changes run /graphify --update in your AI assistant`, or a `graphify-out/needs_update` flag exists). The manual steps exist to let you insert yourself into the pipeline at the semantic-extraction point; they are not a substitute for the CLI on code-only changes.
+
+**Neo4j backend + manual runbook:** the manual steps write only the local `graphify-out/graph.json`; they do NOT sync the database. If `graphify-out/backend.json` exists, finish the runbook with `graphify backend push` (delta push of the local cache to Neo4j) — otherwise the database silently falls behind the local graph.
+
 ```bash
 $(cat graphify-out/.graphify_python) -c "
 import sys, json

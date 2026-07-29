@@ -773,3 +773,32 @@ def test_ensure_out_gitignore_idempotent(tmp_path):
     gi.write_text("custom\n", encoding="utf-8")
     ensure_out_gitignore(out)  # never overwrites
     assert gi.read_text(encoding="utf-8") == "custom\n"
+
+
+def test_cli_backend_push_delta(tmp_path, monkeypatch, capsys):
+    import graphify.backends as backends
+    from graphify import cli
+    out = tmp_path / "graphify-out"
+    out.mkdir()
+    (out / "backend.json").write_text(json.dumps(
+        {"backend": "neo4j", "uri": "neo4j://h:7687"}), encoding="utf-8")
+    # DB has the sample graph; local cache has one extra node (e.g. written by
+    # the skill's manual semantic runbook) -> push must carry the delta.
+    db_data = _sample_data()
+    local = _sample_data()
+    local["nodes"].append({"id": "n3", "label": "manual", "file_type": "document"})
+    (out / "graph.json").write_text(json.dumps(local), encoding="utf-8")
+    fb = _FakeSyncBackend(version=7, data=db_data)
+    fb.branch = "main"
+    monkeypatch.setattr(backends, "open_backend", lambda *a, **kw: fb)
+    monkeypatch.delenv("GRAPHIFY_NEO4J_URI", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["graphify", "backend", "push"])
+    cli.dispatch_command("backend")
+    assert "Branch 'main' updated" in capsys.readouterr().out
+    assert len(fb.save_calls) == 1
+    pushed_data, prior = fb.save_calls[0]
+    assert prior == db_data, "delta must be computed against the DB's real content"
+    assert any(n["id"] == "n3" for n in pushed_data["nodes"])
+    from graphify.backends import load_backend_state
+    assert load_backend_state(out)["version"] == fb.version
