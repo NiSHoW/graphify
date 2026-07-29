@@ -438,6 +438,9 @@ def _touch_query_stamp(graph_path: "Path") -> None:
     """Record that graphify oriented the agent recently, next to the queried graph.
     The strict guard suppresses its block while this stamp is fresh. Fail-silent."""
     try:
+        from graphify.backends import is_backend_ref
+        if is_backend_ref(str(graph_path)):
+            return  # backend URI: no local dir to stamp next to
         from graphify.paths import write_text_atomic
         stamp = Path(graph_path).parent / "cache" / "last_query_stamp"
         stamp.parent.mkdir(parents=True, exist_ok=True)
@@ -891,19 +894,33 @@ def dispatch_command(cmd: str) -> None:
                 i += 2
             else:
                 i += 1
-        gp = Path(graph_path).resolve()
-        if not gp.exists():
-            print(f"error: graph file not found: {gp}", file=sys.stderr)
-            sys.exit(1)
-        if not gp.suffix == ".json":
-            print(f"error: graph file must be a .json file", file=sys.stderr)
-            sys.exit(1)
-        _enforce_graph_size_cap_or_exit(gp)
+        from graphify.backends import is_backend_ref as _is_backend_ref
+        if _is_backend_ref(graph_path):
+            # neo4j:// ref: keep the raw string (Path() mangles URIs on Windows)
+            # and load from the backend. The node-count cap inside
+            # load_graph_data guards the same DoS the file size cap does.
+            gp = graph_path
+            try:
+                from graphify.backends import load_graph_data_any
+                _raw, _ = load_graph_data_any(graph_path)
+            except Exception as exc:
+                print(f"error: could not load graph from Neo4j: {exc}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            gp = Path(graph_path).resolve()
+            if not gp.exists():
+                print(f"error: graph file not found: {gp}", file=sys.stderr)
+                sys.exit(1)
+            if not gp.suffix == ".json":
+                print(f"error: graph file must be a .json file", file=sys.stderr)
+                sys.exit(1)
+            _enforce_graph_size_cap_or_exit(gp)
         try:
             import json as _json
             import networkx as _nx
 
-            _raw = _json.loads(gp.read_text(encoding="utf-8"))
+            if isinstance(gp, Path):  # backend refs loaded _raw above
+                _raw = _json.loads(gp.read_text(encoding="utf-8"))
             if "links" not in _raw and "edges" in _raw:
                 _raw = dict(_raw, links=_raw["edges"])
             # `query` deliberately keeps the graph undirected (unlike `path` /
@@ -1002,13 +1019,17 @@ def dispatch_command(cmd: str) -> None:
                 i += 1
             else:
                 i += 1
-        gp = Path(graph_path).resolve()
-        if not gp.exists():
-            print(f"error: graph file not found: {gp}", file=sys.stderr)
-            sys.exit(1)
-        if not gp.suffix == ".json":
-            print("error: graph file must be a .json file", file=sys.stderr)
-            sys.exit(1)
+        from graphify.backends import is_backend_ref as _is_backend_ref
+        if _is_backend_ref(graph_path):
+            gp = graph_path  # neo4j:// ref — load_graph routes it to the backend
+        else:
+            gp = Path(graph_path).resolve()
+            if not gp.exists():
+                print(f"error: graph file not found: {gp}", file=sys.stderr)
+                sys.exit(1)
+            if not gp.suffix == ".json":
+                print("error: graph file must be a .json file", file=sys.stderr)
+                sys.exit(1)
         try:
             graph = load_graph(gp)
         except Exception as exc:
@@ -1923,6 +1944,166 @@ def dispatch_command(cmd: str) -> None:
             )
             sys.exit(1)
 
+    elif cmd == "backend":
+        # Opt-in/out of the Neo4j source-of-truth backend for this project.
+        # Config lives in <out>/backend.json (no credentials — the password
+        # stays in NEO4J_PASSWORD / GRAPHIFY_NEO4J_PASSWORD, F-031).
+        from graphify.backends import (
+            BACKEND_CONFIG_NAME,
+            backend_config,
+            ensure_out_gitignore,
+            open_backend,
+            parse_backend_uri,
+        )
+        sub = sys.argv[2] if len(sys.argv) > 2 else ""
+        out_dir = Path(_GRAPHIFY_OUT)
+        cfg_path = out_dir / BACKEND_CONFIG_NAME
+        if sub == "set":
+            args = sys.argv[3:]
+            uri: str | None = None
+            user: str | None = None
+            database: str | None = None
+            i = 0
+            while i < len(args):
+                if args[i] == "--user" and i + 1 < len(args):
+                    user = args[i + 1]
+                    i += 2
+                elif args[i] == "--database" and i + 1 < len(args):
+                    database = args[i + 1]
+                    i += 2
+                elif args[i].startswith("-"):
+                    print(f"error: unknown backend set option: {args[i]}", file=sys.stderr)
+                    sys.exit(2)
+                else:
+                    uri = args[i]
+                    i += 1
+            if not uri:
+                print("Usage: graphify backend set neo4j://host:7687[/database] "
+                      "[--user U] [--database D]", file=sys.stderr)
+                sys.exit(2)
+            try:
+                cfg = parse_backend_uri(uri)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            if user:
+                cfg["user"] = user
+            if database:
+                cfg["database"] = database
+            try:
+                b = open_backend(cfg, branch="_default")
+                b.ensure_schema()
+                b.close()
+            except (ImportError, ValueError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            except Exception as exc:
+                print(f"error: could not connect to Neo4j at {cfg['uri']}: {exc}", file=sys.stderr)
+                sys.exit(1)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            # Self-ignoring output dir: from now on graph.json here is a local
+            # cache of the Neo4j graph and must never be committed.
+            ensure_out_gitignore(out_dir)
+            from graphify.paths import write_json_atomic
+            write_json_atomic(cfg_path, cfg, indent=2)
+            print(f"Neo4j backend configured: {cfg['uri']} (database {cfg['database']}, user {cfg['user']})")
+            print(f"Config written to {cfg_path}; graph.json in that directory is now a local cache.")
+        elif sub == "show":
+            cfg = backend_config(out_dir)
+            if cfg is None:
+                print("No backend configured (file mode: graph.json is the source of truth).")
+            else:
+                src = "env GRAPHIFY_NEO4J_URI" if os.environ.get("GRAPHIFY_NEO4J_URI") else str(cfg_path)
+                print(json.dumps(cfg, indent=2))
+                print(f"(from {src})")
+        elif sub == "unset":
+            if cfg_path.exists():
+                cfg_path.unlink()
+                print(f"Removed {cfg_path} — back to file mode (graph.json is the source of truth).")
+            else:
+                print("No backend.json configured; nothing to remove.")
+            if os.environ.get("GRAPHIFY_NEO4J_URI"):
+                print("note: GRAPHIFY_NEO4J_URI is set in the environment and still opts this "
+                      "project in; unset it to fully return to file mode.", file=sys.stderr)
+        else:
+            print("Usage: graphify backend <set|show|unset>", file=sys.stderr)
+            sys.exit(2)
+
+    elif cmd == "branches":
+        # List/manage per-branch graphs stored in the Neo4j backend.
+        from graphify.backends import backend_config, current_branch, open_backend
+        cfg = backend_config(Path(_GRAPHIFY_OUT))
+        if cfg is None:
+            print("error: no Neo4j backend configured (run: graphify backend set <uri>)", file=sys.stderr)
+            sys.exit(1)
+        args = sys.argv[2:]
+        delete_name: str | None = None
+        prune = False
+        i = 0
+        while i < len(args):
+            if args[i] == "--delete" and i + 1 < len(args):
+                delete_name = args[i + 1]
+                i += 2
+            elif args[i] == "--prune":
+                prune = True
+                i += 1
+            else:
+                print(f"error: unknown branches option: {args[i]}", file=sys.stderr)
+                sys.exit(2)
+        try:
+            b = open_backend(cfg, branch="_default")
+        except (ImportError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            if delete_name:
+                res = b.delete_branch(delete_name)
+                if res.get("meta"):
+                    print(f"Deleted branch {delete_name!r} ({res['nodes']} nodes).")
+                else:
+                    print(f"No branch {delete_name!r} in the backend.", file=sys.stderr)
+                    sys.exit(1)
+            elif prune:
+                import subprocess as _sp
+                try:
+                    r = _sp.run(["git", "for-each-ref", "refs/heads", "--format=%(refname:short)"],
+                                capture_output=True, text=True, timeout=5)
+                    local = {l.strip() for l in r.stdout.splitlines() if l.strip()} if r.returncode == 0 else None
+                except (OSError, _sp.TimeoutExpired):
+                    local = None
+                if local is None:
+                    print("error: could not list local git branches; not pruning.", file=sys.stderr)
+                    sys.exit(1)
+                cur = current_branch()
+                pruned = 0
+                for meta in b.list_branches():
+                    name = meta.get("branch", "")
+                    if name == "_default" or name == cur or name in local:
+                        continue
+                    res = b.delete_branch(name)
+                    print(f"Pruned branch {name!r} ({res['nodes']} nodes).")
+                    pruned += 1
+                if not pruned:
+                    print("Nothing to prune: every backend branch matches a local git branch.")
+            else:
+                metas = b.list_branches()
+                if not metas:
+                    print("No branches in the backend yet — run a build to seed one.")
+                else:
+                    cur = current_branch()
+                    for meta in metas:
+                        name = meta.get("branch", "?")
+                        marker = "*" if name == cur else " "
+                        print(f"{marker} {name}  v{meta.get('version', '?')}  "
+                              f"{meta.get('node_count', '?')} nodes / {meta.get('edge_count', '?')} edges  "
+                              f"commit {str(meta.get('built_at_commit', ''))[:7] or '-'}  "
+                              f"updated {meta.get('updated_at', '-')}")
+        except Exception as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        finally:
+            b.close()
+
     elif cmd == "hook-check":
         # Codex Desktop rejects hookSpecificOutput.additionalContext on PreToolUse.
         # Keep this as a cross-platform no-op so installed hooks never break Bash
@@ -2440,13 +2621,31 @@ def dispatch_command(cmd: str) -> None:
 
         elif subcmd == "neo4j":
             if push_uri:
-                from graphify.export import push_to_neo4j as _push
                 if push_password is None:
                     print("error: --password required for --push", file=sys.stderr)
                     sys.exit(1)
-                result = _push(G, uri=push_uri, user=push_user,
-                               password=push_password, communities=communities)
-                print(f"Pushed to Neo4j: {result['nodes']} nodes, {result['edges']} edges")
+                from graphify.backends import backend_config as _backend_config
+                if _backend_config(out_dir) is not None:
+                    # Project opted into the round-trip backend schema: push
+                    # through it (branch-tagged full replace) so a manual
+                    # export cannot fork the schema the MCP server reads.
+                    from graphify.backends import current_branch as _cur_branch
+                    from graphify.backends.neo4j import Neo4jBackend as _NB
+                    data = json.loads(graph_path.read_text(encoding="utf-8"))
+                    b = _NB(push_uri, push_user, push_password,
+                            branch=_cur_branch())
+                    try:
+                        b.ensure_schema()
+                        result = b.save_graph_data(data, prior=None)
+                    finally:
+                        b.close()
+                    print(f"Pushed to Neo4j (branch {b.branch!r}): "
+                          f"{result['nodes']} nodes, {result['edges']} edges")
+                else:
+                    from graphify.export import push_to_neo4j as _push
+                    result = _push(G, uri=push_uri, user=push_user,
+                                   password=push_password, communities=communities)
+                    print(f"Pushed to Neo4j: {result['nodes']} nodes, {result['edges']} edges")
             else:
                 from graphify.export import to_cypher as _to_cypher
                 _to_cypher(G, str(out_dir / "cypher.txt"))
@@ -2727,6 +2926,15 @@ def dispatch_command(cmd: str) -> None:
         out_root = (out_dir.resolve() if out_dir else target)
         graphify_out = out_root / _GRAPHIFY_OUT
         graphify_out.mkdir(parents=True, exist_ok=True)
+        # Neo4j backend (opt-in via `graphify backend set`): refresh the local
+        # graph.json cache from the DB before the incremental baseline below is
+        # read, then push after the write. Fail closed when configured but
+        # unreachable — connectivity is verified BEFORE the (potentially
+        # expensive, LLM-backed) extraction starts.
+        from graphify.backends import BackendSync as _BackendSync
+        _backend_sync = _BackendSync(graphify_out, repo_root=target)
+        if not _backend_sync.prepare():
+            sys.exit(1)
         # Persist corpus-shaping options so later update/watch/hook rebuilds
         # use the same file set as the initial extraction (#1886).
         from graphify.watch import (
@@ -2771,6 +2979,10 @@ def dispatch_command(cmd: str) -> None:
         # --force: full scan, not the manifest-gated incremental diff — a warm
         # unchanged tree would otherwise dispatch zero files (#1894).
         incremental_mode = incremental_mode and not force
+        if _backend_sync.enabled and not incremental_mode:
+            # A full build is authoritative: replace the branch wholesale
+            # instead of diffing against a possibly-stale prior snapshot.
+            _backend_sync.prior = None
         if force:
             print("[graphify extract] --force: full re-scan, semantic cache reads skipped")
         elif incremental_mode and not manifest_path.exists():
@@ -3349,6 +3561,8 @@ def dispatch_command(cmd: str) -> None:
                     _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus, clear_semantic=_cleared_semantic)
                 except Exception as exc:
                     print(f"[graphify extract] warning: could not write manifest: {exc}", file=sys.stderr)
+                _backend_sync.push(changed=bool(graph_stale_sources))
+                _backend_sync.close()
                 stages.total()
                 sys.exit(0)
 
@@ -3467,6 +3681,8 @@ def dispatch_command(cmd: str) -> None:
                               f"(+{result['nodes_added']} nodes, -{result['nodes_removed']} pruned).")
                 except Exception as exc:
                     print(f"[graphify global] warning: failed to merge into global graph: {exc}", file=sys.stderr)
+            _backend_sync.push()
+            _backend_sync.close()
             stages.total()
             sys.exit(0)
 
@@ -3568,6 +3784,8 @@ def dispatch_command(cmd: str) -> None:
             )
         except OSError:
             pass
+        _backend_sync.push()
+        _backend_sync.close()
         stages.mark("export")
         if merged.get("output_tokens", 0) > 0:
             (graphify_out / ".graphify_semantic_marker").write_text(

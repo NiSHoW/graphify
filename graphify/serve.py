@@ -19,6 +19,42 @@ except ImportError:
     _jieba = None
 
 
+def _graph_from_data(data: dict, *, sidecar_graph_path: "Path | None" = None) -> nx.Graph:
+    """Build the directed serve-side graph from a graph.json-shaped dict.
+
+    Shared by the file loader below and the Neo4j backend path (which gets the
+    same dict from the DB instead of disk). ``sidecar_graph_path`` locates the
+    work-memory overlay next to the local graph.json; None (a raw backend URI
+    with no project dir) leaves the overlay empty.
+    """
+    if "links" not in data and "edges" in data:
+        data = dict(data, links=data["edges"])
+    data = {**data, "directed": True}
+    try:
+        from graphify.build import graph_has_legacy_ids as _legacy
+        if _legacy(data.get("nodes", [])):
+            print(
+                "[graphify] note: this graph uses the pre-#1504 node-ID scheme; "
+                "rebuild with `graphify extract --force` for path-qualified IDs.",
+                file=sys.stderr,
+            )
+    except Exception:
+        pass
+    try:
+        G = json_graph.node_link_graph(data, edges="links")
+    except TypeError:
+        G = json_graph.node_link_graph(data)
+    # Attach the work-memory overlay (derived sidecar next to graph.json) so
+    # the query/MCP read surface can annotate NODE lines display-only. Empty
+    # when no sidecar exists, leaving un-annotated output byte-identical.
+    try:
+        from graphify.reflect import load_learning_overlay as _llo
+        G.graph["_learning_overlay"] = _llo(sidecar_graph_path) if sidecar_graph_path else {}
+    except Exception:
+        G.graph["_learning_overlay"] = {}
+    return G
+
+
 def _load_graph(graph_path: str) -> nx.Graph:
     try:
         resolved = Path(graph_path).resolve()
@@ -29,38 +65,76 @@ def _load_graph(graph_path: str) -> nx.Graph:
         check_graph_file_size_cap(resolved)
         safe = resolved
         data = json.loads(safe.read_text(encoding="utf-8"))
-        if "links" not in data and "edges" in data:
-            data = dict(data, links=data["edges"])
-        data = {**data, "directed": True}
-        try:
-            from graphify.build import graph_has_legacy_ids as _legacy
-            if _legacy(data.get("nodes", [])):
-                print(
-                    "[graphify] note: this graph uses the pre-#1504 node-ID scheme; "
-                    "rebuild with `graphify extract --force` for path-qualified IDs.",
-                    file=sys.stderr,
-                )
-        except Exception:
-            pass
-        try:
-            G = json_graph.node_link_graph(data, edges="links")
-        except TypeError:
-            G = json_graph.node_link_graph(data)
-        # Attach the work-memory overlay (derived sidecar next to graph.json) so
-        # the query/MCP read surface can annotate NODE lines display-only. Empty
-        # when no sidecar exists, leaving un-annotated output byte-identical.
-        try:
-            from graphify.reflect import load_learning_overlay as _llo
-            G.graph["_learning_overlay"] = _llo(resolved)
-        except Exception:
-            G.graph["_learning_overlay"] = {}
-        return G
+        return _graph_from_data(data, sidecar_graph_path=resolved)
     except json.JSONDecodeError as exc:
         print(f"error: graph.json is corrupted ({exc}). Re-run /graphify to rebuild.", file=sys.stderr)
         sys.exit(1)
     except (ValueError, FileNotFoundError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
+
+
+def _load_backend_ctx(path: str, *, cfg, out_dir: "Path | None",
+                      cache: dict, lock, ttl: float):
+    """Backend-mode counterpart of the file branch in ``_load_ctx``: the cache
+    key is (branch, GraphifyMeta.version), polled at most every ``ttl`` seconds.
+    The writer bumps the version as the last statement of its transaction, so a
+    version-keyed reader never observes a torn graph. A failed poll with a warm
+    cache serves the cached graph (Neo4j briefly down must not take the server
+    down with it).
+
+    Module-level with explicit cache/lock/ttl so the polling behaviour is
+    directly testable; ``_build_server`` passes its per-server cache in.
+    """
+    import time
+    from graphify.backends import current_branch, open_backend
+    now = time.monotonic()
+    ent = cache.get(path)
+    if ent is not None and now - ent.get("last_poll", 0.0) < ttl:
+        return ent["G"], ent["communities"]
+    with lock:
+        ent = cache.get(path)
+        now = time.monotonic()
+        if ent is not None and now - ent.get("last_poll", 0.0) < ttl:
+            return ent["G"], ent["communities"]  # another thread polled
+        # Re-detect the branch on every poll so a checkout under a running
+        # server re-scopes its queries within one TTL.
+        repo_root = out_dir.parent if out_dir is not None else None
+        branch = current_branch(repo_root)
+        try:
+            backend = ent.get("backend") if ent else None
+            if backend is None:
+                backend = open_backend(cfg if cfg is not None else path,
+                                       out_dir=out_dir, branch=branch)
+            backend.branch = branch
+            version = backend.get_version()
+        except Exception as exc:
+            if ent is not None:
+                print(f"[graphify] warning: Neo4j poll failed ({exc}); "
+                      f"serving cached graph", file=sys.stderr)
+                ent["last_poll"] = now
+                return ent["G"], ent["communities"]
+            raise RuntimeError(f"could not reach Neo4j backend for {path}: {exc}") from exc
+        key = (branch, version)
+        if ent is not None and ent["key"] == key:
+            ent["last_poll"] = now
+            return ent["G"], ent["communities"]
+        if version is None:
+            raise FileNotFoundError(
+                f"no graph for branch {branch!r} in the Neo4j backend — run a build first"
+            )
+        data = backend.load_graph_data()
+        if data is None:  # branch deleted between the version query and now
+            raise FileNotFoundError(
+                f"no graph for branch {branch!r} in the Neo4j backend — run a build first"
+            )
+        sidecar = (out_dir / "graph.json") if out_dir is not None else None
+        new_G = _graph_from_data(data, sidecar_graph_path=sidecar)
+        _get_trigram_index(new_G)
+        comm = _communities_from_graph(new_G)
+        cache[path] = {"key": key, "G": new_G, "communities": comm,
+                       "backend": backend, "last_poll": now}
+        return new_G, comm
 
 
 def _communities_from_graph(G: nx.Graph) -> dict[int, list[str]]:
@@ -1128,13 +1202,34 @@ def _build_server(graph_path: str):
     _ctx_lock = threading.Lock()
     _ctx_cache: dict[str, dict] = {}
 
+    # Neo4j hot-reload cadence: within the TTL a cached graph is served without
+    # touching the DB; past it, one cheap version query decides whether to do a
+    # full reload. The Neo4j analogue of the (mtime, size) key below.
+    import os as _os
+    try:
+        _neo4j_ttl = float(_os.environ.get("GRAPHIFY_NEO4J_TTL", "10"))
+    except ValueError:
+        _neo4j_ttl = 10.0
+
     def _load_ctx(path: str):
         """Return (G, communities) for a graph.json path, reusing a cached
         context until the file's (mtime, size) changes and then transparently
         rebuilding it. Unlike ``_load_graph`` it never exits the process on a
         missing/corrupt file — it raises, so a bad project_path surfaces as a
         tool error instead of killing a server that is happily serving other
-        projects."""
+        projects.
+
+        A ``neo4j://`` ref, or a graph.json path whose directory carries a
+        ``backend.json`` (written by ``graphify backend set``), routes to the
+        Neo4j backend instead — same cache, version-keyed with a poll TTL."""
+        from graphify.backends import backend_config, is_backend_ref
+        if is_backend_ref(path):
+            return _load_backend_ctx(path, cfg=None, out_dir=None,
+                                     cache=_ctx_cache, lock=_ctx_lock, ttl=_neo4j_ttl)
+        cfg = backend_config(Path(path).parent)
+        if cfg is not None:
+            return _load_backend_ctx(path, cfg=cfg, out_dir=Path(path).parent,
+                                     cache=_ctx_cache, lock=_ctx_lock, ttl=_neo4j_ttl)
         try:
             s = Path(path).stat()
             key = (s.st_mtime_ns, s.st_size)

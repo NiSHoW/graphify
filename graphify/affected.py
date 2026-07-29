@@ -251,6 +251,18 @@ def load_graph(path: Path) -> nx.Graph:
     import json
     from networkx.readwrite import json_graph
 
+    from graphify.backends import is_backend_ref
+    if is_backend_ref(str(path)):
+        from graphify.backends import load_graph_data_any
+        raw, _ = load_graph_data_any(str(path))
+        raw = {**raw, "directed": True}
+        if "links" not in raw and "edges" in raw:
+            raw = dict(raw, links=raw["edges"])
+        try:
+            return json_graph.node_link_graph(raw, edges="links")
+        except TypeError:
+            return json_graph.node_link_graph(raw)
+
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:

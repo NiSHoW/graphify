@@ -983,6 +983,17 @@ def _rebuild_code(
             print("[graphify watch] No code files found - nothing to rebuild.")
             return False
 
+        # Neo4j backend (opt-in via `graphify backend set`): refresh the local
+        # graph.json cache from the DB before the rebuild so the incremental
+        # pipeline below reconciles against the branch's true state, then push
+        # the delta after the local write. Fail closed when the backend is
+        # configured but unreachable — the user opted into Neo4j as the source
+        # of truth, so silently rebuilding file-only would fork the two.
+        from graphify.backends import BackendSync
+        _backend_sync = BackendSync(out, repo_root=watch_root)
+        if not _backend_sync.prepare():
+            return False
+
         # #1915: a document that already carries SEMANTIC (LLM) nodes in the
         # existing graph must not ALSO be AST-quick-scanned — otherwise every
         # rebuild mints heading nodes on top of the preserved semantic nodes
@@ -1250,6 +1261,8 @@ def _rebuild_code(
                     f"{len(candidate_graph_data.get('links', []))} edges"
                 )
                 print(f"[graphify watch] graph.json updated in {out}")
+            _backend_sync.push(changed=not same_graph)
+            _backend_sync.close()
             return True
 
         detection = {
@@ -1282,6 +1295,8 @@ def _rebuild_code(
                 if flag.exists():
                     flag.unlink()
                 print("[graphify watch] No code-graph topology changes detected; outputs left untouched.")
+                _backend_sync.push(changed=False)
+                _backend_sync.close()
                 return True
 
         communities = cluster(G)
@@ -1489,6 +1504,8 @@ def _rebuild_code(
             if callflow_files:
                 products += f", {len(callflow_files)} callflow HTML"
             print(f"[graphify watch] {products} updated in {out}")
+        _backend_sync.push(changed=not no_change)
+        _backend_sync.close()
         return True
 
     except Exception as exc:

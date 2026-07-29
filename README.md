@@ -485,6 +485,34 @@ docker run -p 8080:8080 -v "$(pwd)/graphify-out:/data" graphify \
 > python3 -m venv .venv && .venv/bin/pip install "graphifyy[mcp]"
 > ```
 
+### Neo4j as the source of truth (opt-in)
+
+By default graphify stores the graph in `graphify-out/graph.json` and Neo4j is just an export target. With the Neo4j **backend** enabled, the database becomes the source of truth instead: builds and updates write straight to it, and the MCP server reads from it — including changes made to the DB by other tools.
+
+```bash
+pip install "graphifyy[neo4j]"
+export NEO4J_PASSWORD=...              # never on argv, never in config files
+graphify backend set neo4j://localhost:7687   # verifies connectivity, writes graphify-out/backend.json
+graphify extract .                     # builds and seeds the current git branch in Neo4j
+graphify update                        # incremental: pushes only the delta, in one transaction
+python -m graphify.serve graphify-out/graph.json   # now polls Neo4j (version-keyed, TTL below)
+graphify query "auth flow" --graph neo4j://localhost:7687   # ad-hoc reads work too
+graphify branches                      # one graph per git branch; --prune drops stale ones
+graphify backend unset                 # back to file mode
+```
+
+How it works:
+
+- **Branch tagging.** Every node/edge is tagged with the current git branch (detached HEAD becomes `detached-<sha>`; outside a repo, `_default`; override with `GRAPHIFY_BRANCH`). Multiple branches coexist in one database; queries are scoped to the branch you're on.
+- **Local cache.** `graphify-out/graph.json` remains on disk as a derived cache (the output dir gets a self-ignoring `.gitignore`, so nothing lands in git). Before each update the branch's graph is materialized from Neo4j; after it, the delta is pushed in a single transaction whose last statement bumps a per-branch version counter — readers keyed on that version never see a torn graph.
+- **Freshness.** The MCP server polls the version at most every `GRAPHIFY_NEO4J_TTL` seconds (default 10) and reloads only when it changed. Edits made directly in Neo4j show up within one TTL. If the DB is briefly down, the server keeps serving its cached graph.
+- **Fail closed.** If the backend is configured but unreachable, `build`/`update` abort instead of silently forking a file-only graph. If a push fails after a successful local rebuild, the local graph stays valid, the state is marked dirty, and the next run re-pushes the backlog.
+- **Round-trip schema.** Nodes carry `:GraphifyNode` plus a label derived from `file_type`; original `relation`/`file_type` strings, hyperedges and `built_at_commit` are preserved as properties/metadata, so what you read back equals what was written.
+
+Configuration: `graphify backend set` (writes `backend.json`, no credentials) or the `GRAPHIFY_NEO4J_URI` / `GRAPHIFY_NEO4J_USER` / `GRAPHIFY_NEO4J_DATABASE` env vars; the password comes only from `NEO4J_PASSWORD` (or `GRAPHIFY_NEO4J_PASSWORD`).
+
+Known limits: community labels and the work-memory overlay (`.graphify_labels.json`, `.graphify_learning.json`) stay local files, so other machines sharing the DB see the graph but not this machine's annotations; concurrent writers on the same branch from different machines are last-write-wins.
+
 ---
 
 ## Environment variables

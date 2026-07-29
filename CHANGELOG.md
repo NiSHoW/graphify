@@ -2,6 +2,10 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## Unreleased
+
+- Feature: optional Neo4j **source-of-truth backend** (`graphify backend set neo4j://host:7687`), not just an export sink. When enabled: `extract`/`update` write straight to Neo4j (incremental delta in one transaction, per-branch version counter bumped last so readers never see a torn graph); the MCP server reads from Neo4j with a version-keyed poll (`GRAPHIFY_NEO4J_TTL`, default 10s) and so picks up changes made directly in the DB; every node/edge is tagged with the current git branch so branches coexist in one database (`graphify branches [--delete NAME|--prune]` manages them). The schema round-trips graph.json faithfully (original `relation`/`file_type` strings, hyperedges, `built_at_commit`, underscore/None attributes). `graphify-out/graph.json` remains as a derived local cache and the output dir gets a self-ignoring `.gitignore`. Fail-closed when the backend is configured but unreachable; a failed push marks the local state dirty and the next run re-pushes the backlog. `neo4j://` URIs are also accepted wherever a graph path is (`query --graph`, `serve`, `affected`). Credentials stay in `NEO4J_PASSWORD`/`GRAPHIFY_NEO4J_PASSWORD` (never argv or config files); the legacy `export neo4j --push` is unchanged for projects without the backend.
+
 ## 0.9.29 (2026-07-28)
 
 - Fix: absolute-path / machine-slug node ids no longer leak into edge endpoints (#2231, #2243). Module-top-level `indirect_call` sources, bash `source`/script-invocation targets, and other producers that minted an id from an absolute path are now canonicalized to the root-relative node id by a general backstop, so `graph.json` link endpoints are portable across machines and clones.
