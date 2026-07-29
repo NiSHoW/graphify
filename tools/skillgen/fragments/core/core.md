@@ -49,6 +49,8 @@ If the user invoked `/graphify --help` or `/graphify -h` (with no other argument
 
 **Fast path — existing graph:** Before doing anything else, check whether `graphify-out/graph.json` exists. The expected location is `graphify-out/graph.json` relative to the **current working directory** (i.e. the project root where you are running commands). If it exists AND the user's request is a natural-language question about the codebase (e.g. "How does X work?", "What calls Y?", "Trace the data flow through Z") and NOT an explicit rebuild command (`--update`, `--cluster-only`, or a bare path/URL that implies fresh extraction): **skip Steps 1–5 entirely and jump straight to `## For /graphify query`.** Run `graphify query "<question>"` immediately. Do not run detect. Do not check corpus size. Do not ask the user to narrow. The graph is already built — use it.
 
+**Neo4j backend:** If `graphify-out/backend.json` exists, the graph's source of truth is a Neo4j database and `graph.json` is only a local cache. When `backend.json` exists but `graph.json` is missing, do NOT rebuild: run `graphify backend pull` (materializes the current branch's graph from the database in seconds, no extraction) and then treat it as the fast path above. Only fall back to a full build if the pull reports that the branch has never been built.
+
 If no path was given, use `.` (current directory). Do not ask the user for a path.
 
 If the path argument starts with `https://github.com/` or `http://github.com/`, treat it as a GitHub URL - run Step 0 before anything else, then continue with the resolved local path.

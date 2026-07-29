@@ -722,6 +722,47 @@ def test_sync_push_failure_marks_dirty_then_recovers(sync_env, capsys):
     assert not load_backend_state(out).get("dirty")
 
 
+# --- CLI: backend pull (reader onboarding) ---
+
+def test_cli_backend_pull_materializes(tmp_path, monkeypatch, capsys):
+    import graphify.backends as backends
+    from graphify import cli
+    out = tmp_path / "graphify-out"
+    out.mkdir()
+    (out / "backend.json").write_text(json.dumps(
+        {"backend": "neo4j", "uri": "neo4j://h:7687"}), encoding="utf-8")
+    fb = _FakeSyncBackend(version=4, data=_sample_data())
+    fb.branch = "main"
+    monkeypatch.setattr(backends, "open_backend", lambda *a, **kw: fb)
+    monkeypatch.delenv("GRAPHIFY_NEO4J_URI", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["graphify", "backend", "pull"])
+    cli.dispatch_command("backend")
+    assert "Materialized branch 'main'" in capsys.readouterr().out
+    data = json.loads((out / "graph.json").read_text(encoding="utf-8"))
+    assert {n["id"] for n in data["nodes"]} == {"n1", "n2"}
+    from graphify.backends import load_backend_state
+    assert load_backend_state(out)["version"] == 4
+    assert fb.closed
+
+
+def test_cli_backend_pull_empty_branch_fails_clearly(tmp_path, monkeypatch, capsys):
+    import graphify.backends as backends
+    from graphify import cli
+    out = tmp_path / "graphify-out"
+    out.mkdir()
+    (out / "backend.json").write_text(json.dumps(
+        {"backend": "neo4j", "uri": "neo4j://h:7687"}), encoding="utf-8")
+    fb = _FakeSyncBackend(version=None, data=None)  # branch never written
+    monkeypatch.setattr(backends, "open_backend", lambda *a, **kw: fb)
+    monkeypatch.delenv("GRAPHIFY_NEO4J_URI", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["graphify", "backend", "pull"])
+    with pytest.raises(SystemExit):
+        cli.dispatch_command("backend")
+    assert "run a build first" in capsys.readouterr().err
+
+
 # --- .gitignore self-ignore ---
 
 def test_ensure_out_gitignore_idempotent(tmp_path):

@@ -909,8 +909,36 @@ def dispatch_command(cmd: str) -> None:
         else:
             gp = Path(graph_path).resolve()
             if not gp.exists():
-                print(f"error: graph file not found: {gp}", file=sys.stderr)
-                sys.exit(1)
+                # Missing local cache with a configured Neo4j backend (fresh
+                # checkout: backend.json exists, graph.json not yet pulled) —
+                # materialize it instead of failing, so a reader colleague's
+                # first query just works.
+                from graphify.backends import backend_config as _bcfg
+                if _bcfg(gp.parent) is not None:
+                    from graphify.backends import (
+                        materialize_from_backend as _mat,
+                        open_backend as _ob,
+                        save_backend_state as _sbs,
+                    )
+                    try:
+                        _b = _ob(_bcfg(gp.parent))
+                        try:
+                            if _mat(gp.parent, _b) is None:
+                                print(f"error: no graph for the current branch in the Neo4j "
+                                      f"backend — run a build first (graphify update .)", file=sys.stderr)
+                                sys.exit(1)
+                            _sbs(gp.parent, version=_b.get_version())
+                        finally:
+                            _b.close()
+                        print(f"[graphify] materialized the graph from Neo4j into {gp}", file=sys.stderr)
+                    except SystemExit:
+                        raise
+                    except Exception as exc:
+                        print(f"error: could not pull the graph from Neo4j: {exc}", file=sys.stderr)
+                        sys.exit(1)
+                else:
+                    print(f"error: graph file not found: {gp}", file=sys.stderr)
+                    sys.exit(1)
             if not gp.suffix == ".json":
                 print(f"error: graph file must be a .json file", file=sys.stderr)
                 sys.exit(1)
@@ -2025,8 +2053,42 @@ def dispatch_command(cmd: str) -> None:
             if os.environ.get("GRAPHIFY_NEO4J_URI"):
                 print("note: GRAPHIFY_NEO4J_URI is set in the environment and still opts this "
                       "project in; unset it to fully return to file mode.", file=sys.stderr)
+        elif sub == "pull":
+            # Materialize the current branch's graph from Neo4j into the local
+            # graph.json cache WITHOUT any extraction — the reader-onboarding
+            # primitive: a fresh checkout with a configured backend gets a
+            # queryable local cache in seconds instead of a full rebuild.
+            cfg = backend_config(out_dir)
+            if cfg is None:
+                print("error: no Neo4j backend configured (run: graphify backend set <uri>)", file=sys.stderr)
+                sys.exit(1)
+            from graphify.backends import (
+                current_branch,
+                materialize_from_backend,
+                save_backend_state,
+            )
+            try:
+                b = open_backend(cfg)
+            except (ImportError, ValueError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                data = materialize_from_backend(out_dir, b)
+                if data is None:
+                    print(f"error: no graph for branch {current_branch()!r} in the "
+                          f"Neo4j backend — run a build first (graphify update .)", file=sys.stderr)
+                    sys.exit(1)
+                save_backend_state(out_dir, version=b.get_version())
+                print(f"Materialized branch {b.branch!r} into {out_dir / 'graph.json'} "
+                      f"({len(data.get('nodes', []))} nodes, "
+                      f"{len(data.get('links', data.get('edges', [])))} edges).")
+            except Exception as exc:
+                print(f"error: could not pull from Neo4j: {exc}", file=sys.stderr)
+                sys.exit(1)
+            finally:
+                b.close()
         else:
-            print("Usage: graphify backend <set|show|unset>", file=sys.stderr)
+            print("Usage: graphify backend <set|show|unset|pull>", file=sys.stderr)
             sys.exit(2)
 
     elif cmd == "branches":
