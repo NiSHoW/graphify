@@ -37,7 +37,19 @@ _STATE_NAME = ".graphify_backend_state.json"
 # .gitignore so the materialized graph.json cache never needs a repo-root
 # .gitignore entry. Only created in backend mode — in file mode some teams
 # commit graph.json on purpose.
-_GITIGNORE_CONTENT = "# graphify: this directory is a local cache of the Neo4j graph\n*\n"
+# backend.json (and the .gitignore itself) are whitelisted: they are project
+# configuration, not derived cache — committing them makes a fresh clone
+# backend-aware with zero setup (query auto-materializes from the DB). The
+# password never lives in backend.json, and GRAPHIFY_NEO4J_URI still overrides
+# the file per-machine.
+_GITIGNORE_LEGACY = "# graphify: this directory is a local cache of the Neo4j graph\n*\n"
+_GITIGNORE_CONTENT = (
+    "# graphify: this directory is a local cache of the Neo4j graph\n"
+    "*\n"
+    "# ...except the backend config: commit it to share backend mode with the team\n"
+    "!.gitignore\n"
+    "!backend.json\n"
+)
 
 
 def is_backend_ref(ref) -> bool:
@@ -206,11 +218,19 @@ def load_graph_data_any(ref_or_path: str) -> tuple[dict, "Path | None"]:
 
 
 def ensure_out_gitignore(out_dir: "Path | str") -> None:
-    """Drop a self-ignoring ``.gitignore`` (containing ``*``) into the output
-    dir. Idempotent: created only when absent, never overwritten."""
+    """Drop a self-ignoring ``.gitignore`` (``*`` with backend.json whitelisted)
+    into the output dir. Idempotent: created when absent; an untouched legacy
+    file (plain ``*``, pre-whitelist) is upgraded in place; anything the user
+    customized is never overwritten."""
     out = Path(out_dir)
     gi = out / ".gitignore"
     if gi.exists():
+        try:
+            current = gi.read_text(encoding="utf-8")
+        except OSError:
+            return
+        if current == _GITIGNORE_LEGACY:
+            gi.write_text(_GITIGNORE_CONTENT, encoding="utf-8")
         return
     out.mkdir(parents=True, exist_ok=True)
     gi.write_text(_GITIGNORE_CONTENT, encoding="utf-8")

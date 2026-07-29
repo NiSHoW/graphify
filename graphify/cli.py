@@ -2036,6 +2036,9 @@ def dispatch_command(cmd: str) -> None:
             write_json_atomic(cfg_path, cfg, indent=2)
             print(f"Neo4j backend configured: {cfg['uri']} (database {cfg['database']}, user {cfg['user']})")
             print(f"Config written to {cfg_path}; graph.json in that directory is now a local cache.")
+            print(f"Tip: commit {cfg_path} to share backend mode with the team — "
+                  f"a fresh clone then auto-materializes from Neo4j on first query "
+                  f"(password stays env-only; GRAPHIFY_NEO4J_URI overrides per machine).")
         elif sub == "show":
             cfg = backend_config(out_dir)
             if cfg is None:
