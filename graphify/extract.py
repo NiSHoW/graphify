@@ -873,14 +873,20 @@ _CSHARP_CONFIG = LanguageConfig(
         "struct_declaration",
         "record_declaration",
     }),
-    function_types=frozenset({"method_declaration"}),
+    # constructor_declaration shares method_declaration's `name`/`parameters`
+    # fields in the C# grammar, so the generic walker and the C#-specific
+    # parameter_type pass handle it unchanged — same treatment as _JAVA_CONFIG.
+    # `returns` is absent on constructors and already guarded. Not covered:
+    # destructor_declaration and C#12 primary constructors (their parameters
+    # live on class_declaration).
+    function_types=frozenset({"method_declaration", "constructor_declaration"}),
     import_types=frozenset({"using_directive"}),
     call_types=frozenset({"invocation_expression"}),
     call_function_field="function",
     call_accessor_node_types=frozenset({"member_access_expression"}),
     call_accessor_field="name",
     body_fallback_child_types=("declaration_list",),
-    function_boundary_types=frozenset({"method_declaration"}),
+    function_boundary_types=frozenset({"method_declaration", "constructor_declaration"}),
     import_handler=_import_csharp,
 )
 
