@@ -765,14 +765,49 @@ def test_cli_backend_pull_empty_branch_fails_clearly(tmp_path, monkeypatch, caps
 
 # --- .gitignore self-ignore ---
 
-def test_ensure_out_gitignore_idempotent(tmp_path):
+def test_ensure_out_gitignore_whitelists_backend_json(tmp_path):
     out = tmp_path / "graphify-out"
     ensure_out_gitignore(out)
     gi = out / ".gitignore"
-    assert gi.read_text(encoding="utf-8").splitlines()[-1] == "*"
+    lines = gi.read_text(encoding="utf-8").splitlines()
+    assert "*" in lines
+    # backend.json is project config, not cache: it must survive the ignore-all
+    # so a committed copy makes fresh clones backend-aware with zero setup.
+    assert lines.index("*") < lines.index("!.gitignore") < lines.index("!backend.json")
     gi.write_text("custom\n", encoding="utf-8")
-    ensure_out_gitignore(out)  # never overwrites
+    ensure_out_gitignore(out)  # never overwrites a customized file
     assert gi.read_text(encoding="utf-8") == "custom\n"
+
+
+def test_ensure_out_gitignore_upgrades_legacy(tmp_path):
+    from graphify.backends import _GITIGNORE_CONTENT, _GITIGNORE_LEGACY
+    out = tmp_path / "graphify-out"
+    out.mkdir()
+    gi = out / ".gitignore"
+    gi.write_text(_GITIGNORE_LEGACY, encoding="utf-8")  # pre-whitelist default
+    ensure_out_gitignore(out)
+    assert gi.read_text(encoding="utf-8") == _GITIGNORE_CONTENT
+
+
+def test_out_gitignore_semantics_with_git(tmp_path):
+    """git itself must see graph.json ignored but backend.json trackable."""
+    import subprocess
+    repo = tmp_path / "repo"
+    out = repo / "graphify-out"
+    out.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    ensure_out_gitignore(out)
+    (out / "graph.json").write_text("{}", encoding="utf-8")
+    (out / "backend.json").write_text("{}", encoding="utf-8")
+
+    def _ignored(name: str) -> bool:
+        r = subprocess.run(["git", "-C", str(repo), "check-ignore", "-q",
+                            f"graphify-out/{name}"], capture_output=True)
+        return r.returncode == 0
+
+    assert _ignored("graph.json")
+    assert not _ignored("backend.json")
+    assert not _ignored(".gitignore")
 
 
 def test_cli_backend_push_delta(tmp_path, monkeypatch, capsys):
