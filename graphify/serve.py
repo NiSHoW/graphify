@@ -2,10 +2,13 @@
 from __future__ import annotations
 import json
 import math
+import os
 import re
 import sys
 from array import array
+from collections import OrderedDict
 from pathlib import Path
+import threading
 from typing import NamedTuple
 import networkx as nx
 from networkx.readwrite import json_graph
@@ -75,13 +78,17 @@ def _load_graph(graph_path: str) -> nx.Graph:
 
 
 def _load_backend_ctx(path: str, *, cfg, out_dir: "Path | None",
-                      cache: dict, lock, ttl: float):
+                      cache: dict, lock, ttl: float, max_contexts: int = 8):
     """Backend-mode counterpart of the file branch in ``_load_ctx``: the cache
     key is (branch, GraphifyMeta.version), polled at most every ``ttl`` seconds.
     The writer bumps the version as the last statement of its transaction, so a
     version-keyed reader never observes a torn graph. A failed poll with a warm
     cache serves the cached graph (Neo4j briefly down must not take the server
     down with it).
+
+    ``max_contexts`` bounds the cache the same way _GraphContextCache bounds
+    project contexts (#2268): inserting past the cap evicts the oldest entry
+    and closes its driver connection.
 
     Module-level with explicit cache/lock/ttl so the polling behaviour is
     directly testable; ``_build_server`` passes its per-server cache in.
@@ -134,6 +141,17 @@ def _load_backend_ctx(path: str, *, cfg, out_dir: "Path | None",
         comm = _communities_from_graph(new_G)
         cache[path] = {"key": key, "G": new_G, "communities": comm,
                        "backend": backend, "last_poll": now}
+        while len(cache) > max(1, max_contexts):
+            _stale_path, stale = next(iter(cache.items()))
+            if _stale_path == path:
+                break  # never evict the entry just inserted
+            del cache[_stale_path]
+            stale_backend = stale.get("backend")
+            if stale_backend is not None and stale_backend is not backend:
+                try:
+                    stale_backend.close()
+                except Exception:
+                    pass
         return new_G, comm
 
 
@@ -145,6 +163,85 @@ def _communities_from_graph(G: nx.Graph) -> dict[int, list[str]]:
         if cid is not None:
             communities.setdefault(int(cid), []).append(node_id)
     return communities
+
+
+def _max_server_contexts() -> int:
+    """Return the project-context LRU capacity (default 8, minimum 1).
+
+    ``GRAPHIFY_MAX_CONTEXTS`` overrides the default. Invalid or blank values
+    use 8; zero and negative values clamp to 1, since each request needs a
+    graph context. The server's configured default graph is pinned separately
+    and does not count against this limit.
+    """
+    raw = os.environ.get("GRAPHIFY_MAX_CONTEXTS", "").strip()
+    if not raw:
+        return 8
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 8
+
+
+class _GraphContextCache:
+    """Thread-safe graph contexts: one pinned default plus an LRU of projects."""
+
+    def __init__(self, max_contexts: int):
+        self._max_contexts = max_contexts
+        self._entries: OrderedDict[str, dict] = OrderedDict()
+        self._pinned: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def _load_entry(self, resolved_path: str, key: tuple[int, int]) -> dict:
+        """Build one entry for an already-resolved path and known file key.
+
+        ``_load_graph`` is also used by the CLI, where invalid input terminates
+        the process. A client-supplied ``project_path`` must instead become a
+        tool error, so the shared MCP server can continue serving other graphs.
+        """
+        try:
+            graph = _load_graph(resolved_path)
+        except SystemExit as exc:
+            raise RuntimeError(f"could not load graph.json at {resolved_path}") from exc
+        # Warm the index before exposing the graph so its first query does not
+        # pay the expensive build cost.
+        _get_trigram_index(graph)
+        communities = _communities_from_graph(graph)
+        entry = {
+            "key": key,
+            "G": graph,
+            "communities": communities,
+        }
+        return entry
+
+    def load(self, resolved_path: str, *, pinned: bool = False) -> tuple[nx.Graph, dict[int, list[str]]]:
+        """Return a fresh context, retaining project contexts by LRU order.
+
+        ``resolved_path`` is resolved by the caller, making this method the
+        sole owner of file statting and cache-key construction.
+
+        ``pinned=True`` is reserved for the server's configured default graph;
+        it remains warm without consuming a project-cache slot.
+        """
+        with self._lock:
+            try:
+                stat_result = Path(resolved_path).stat()
+            except FileNotFoundError:
+                raise FileNotFoundError(f"graph.json not found: {resolved_path}") from None
+            key = (stat_result.st_mtime_ns, stat_result.st_size)
+            entries = self._pinned if pinned else self._entries
+            entry = entries.get(resolved_path)
+            if entry is not None and entry["key"] == key:
+                if not pinned:
+                    self._entries.move_to_end(resolved_path)
+                return entry["G"], entry["communities"]
+
+            entry = self._load_entry(resolved_path, key)
+            entries[resolved_path] = entry
+            if not pinned:
+                self._entries.move_to_end(resolved_path)
+                while len(self._entries) > self._max_contexts:
+                    self._entries.popitem(last=False)
+            return entry["G"], entry["communities"]
 
 
 def _strip_diacritics(text: str | None) -> str:
@@ -1137,9 +1234,6 @@ def _filter_blank_stdin() -> None:
     JSONRPCMessage, so a bare newline triggers a Pydantic ValidationError.
     This installs an OS-level pipe that relays stdin while dropping blanks.
     """
-    import os
-    import threading
-
     r_fd, w_fd = os.pipe()
     saved_fd = os.dup(sys.stdin.fileno())
 
@@ -1182,8 +1276,6 @@ def _build_server(graph_path: str):
     Streamable HTTP) and runs it. Hot-reload of graph.json works the same way
     regardless of transport, since reloads happen inside the tool handlers.
     """
-    import threading
-
     try:
         from mcp.server import Server
         from mcp import types
@@ -1193,14 +1285,17 @@ def _build_server(graph_path: str):
 
     from graphify import paths as _paths
 
-    # Per-graph context cache: resolved graph.json path -> {key, G, communities}.
-    # The server's default graph is just the first entry; a tool call carrying a
-    # project_path adds its own. Routing every graph through one cache means the
-    # eager trigram index and the mtime+size hot-reload behave identically for
-    # the default graph and for any project graph.
-    _default_graph_path = graph_path
-    _ctx_lock = threading.Lock()
-    _ctx_cache: dict[str, dict] = {}
+    # Graph contexts comprise one pinned configured default plus a bounded LRU
+    # of project_path graphs. This preserves the configured graph's warm index
+    # while preventing a shared server from retaining every project it serves.
+    _default_graph_path = str(Path(graph_path).resolve())
+    _ctx_cache = _GraphContextCache(_max_server_contexts())
+    # Backend (Neo4j) contexts live in their own bounded map: their cache key
+    # is (branch, version) with a poll TTL rather than (mtime, size), so they
+    # do not fit _GraphContextCache's stat-based reload contract. Eviction in
+    # _load_backend_ctx honours the same GRAPHIFY_MAX_CONTEXTS bound (#2268).
+    _backend_ctx_cache: OrderedDict[str, dict] = OrderedDict()
+    _backend_ctx_lock = threading.Lock()
 
     # Neo4j hot-reload cadence: within the TTL a cached graph is served without
     # touching the DB; past it, one cheap version query decides whether to do a
@@ -1212,46 +1307,30 @@ def _build_server(graph_path: str):
         _neo4j_ttl = 10.0
 
     def _load_ctx(path: str):
-        """Return (G, communities) for a graph.json path, reusing a cached
-        context until the file's (mtime, size) changes and then transparently
-        rebuilding it. Unlike ``_load_graph`` it never exits the process on a
-        missing/corrupt file — it raises, so a bad project_path surfaces as a
-        tool error instead of killing a server that is happily serving other
-        projects.
+        """Return the current default or project graph context as a tool error.
+
+        Unlike ``_load_graph``, this never lets a missing or corrupt client
+        graph terminate the MCP process; it raises so other projects remain
+        available on the same server.
 
         A ``neo4j://`` ref, or a graph.json path whose directory carries a
         ``backend.json`` (written by ``graphify backend set``), routes to the
-        Neo4j backend instead — same cache, version-keyed with a poll TTL."""
+        Neo4j backend instead — its own bounded cache (same #2268 cap),
+        version-keyed with a poll TTL.
+        """
         from graphify.backends import backend_config, is_backend_ref
         if is_backend_ref(path):
             return _load_backend_ctx(path, cfg=None, out_dir=None,
-                                     cache=_ctx_cache, lock=_ctx_lock, ttl=_neo4j_ttl)
-        cfg = backend_config(Path(path).parent)
+                                     cache=_backend_ctx_cache, lock=_backend_ctx_lock,
+                                     ttl=_neo4j_ttl, max_contexts=_max_server_contexts())
+        resolved_path = str(Path(path).resolve())
+        cfg = backend_config(Path(resolved_path).parent)
         if cfg is not None:
-            return _load_backend_ctx(path, cfg=cfg, out_dir=Path(path).parent,
-                                     cache=_ctx_cache, lock=_ctx_lock, ttl=_neo4j_ttl)
-        try:
-            s = Path(path).stat()
-            key = (s.st_mtime_ns, s.st_size)
-        except FileNotFoundError:
-            raise FileNotFoundError(f"graph.json not found: {path}")
-        ent = _ctx_cache.get(path)
-        if ent is not None and ent["key"] == key:
-            return ent["G"], ent["communities"]
-        with _ctx_lock:
-            ent = _ctx_cache.get(path)
-            if ent is not None and ent["key"] == key:
-                return ent["G"], ent["communities"]  # another thread built it
-            try:
-                new_G = _load_graph(path)
-            except SystemExit as e:  # _load_graph exits on missing/corrupt file
-                raise RuntimeError(f"could not load graph.json at {path}") from e
-            # Warm the trigram index before exposing the graph so the first query
-            # against it is fast (same rationale as the original startup warm-up).
-            _get_trigram_index(new_G)
-            comm = _communities_from_graph(new_G)
-            _ctx_cache[path] = {"key": key, "G": new_G, "communities": comm}
-            return new_G, comm
+            return _load_backend_ctx(resolved_path, cfg=cfg,
+                                     out_dir=Path(resolved_path).parent,
+                                     cache=_backend_ctx_cache, lock=_backend_ctx_lock,
+                                     ttl=_neo4j_ttl, max_contexts=_max_server_contexts())
+        return _ctx_cache.load(resolved_path, pinned=resolved_path == _default_graph_path)
 
     def _resolve_graph_path(project_path) -> str:
         """Map an optional project_path to a concrete graph.json path. ``None``
@@ -1280,7 +1359,7 @@ def _build_server(graph_path: str):
         nonlocal G, communities, active_graph_path
         path = _resolve_graph_path(project_path)
         G, communities = _load_ctx(path)
-        active_graph_path = path
+        active_graph_path = str(Path(path).resolve())
 
     server = Server("graphify")
 
