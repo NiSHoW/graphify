@@ -3,9 +3,10 @@
 A project opts into the Neo4j backend either with the ``GRAPHIFY_NEO4J_URI``
 env var or a ``backend.json`` next to graph.json in the output dir (written by
 ``graphify backend set``). Passwords are NEVER stored in backend.json nor read
-from URI userinfo — only the ``GRAPHIFY_NEO4J_PASSWORD``/``NEO4J_PASSWORD`` env
-vars (same F-031 rationale as ``export neo4j --push``: keep secrets off argv
-and out of version-controllable files).
+from URI userinfo — only the ``GRAPHIFY_NEO4J_PASSWORD`` env var (with the
+generic ``NEO4J_PASSWORD`` accepted as fallback; same F-031 rationale as
+``export neo4j --push``: keep secrets off argv and out of version-controllable
+files).
 
 This module stays importable without the neo4j driver installed: the driver is
 touched only inside :func:`open_backend`.
@@ -76,8 +77,8 @@ def parse_backend_uri(uri: str) -> dict:
     parsed = urlparse(normalize_backend_ref(uri))
     if parsed.password:
         raise ValueError(
-            "password in the URI is not supported; set NEO4J_PASSWORD "
-            "(or GRAPHIFY_NEO4J_PASSWORD) instead"
+            "password in the URI is not supported; set GRAPHIFY_NEO4J_PASSWORD "
+            "(or NEO4J_PASSWORD) instead"
         )
     database = (parsed.path or "").lstrip("/") or "neo4j"
     netloc = parsed.hostname or "localhost"
@@ -128,8 +129,8 @@ def _resolve_password() -> str:
     password = os.environ.get("GRAPHIFY_NEO4J_PASSWORD") or os.environ.get("NEO4J_PASSWORD")
     if not password:
         raise ValueError(
-            "Neo4j backend configured but no password found: set NEO4J_PASSWORD "
-            "(or GRAPHIFY_NEO4J_PASSWORD) in the environment"
+            "Neo4j backend configured but no password found: set "
+            "GRAPHIFY_NEO4J_PASSWORD (or NEO4J_PASSWORD) in the environment"
         )
     return password
 
