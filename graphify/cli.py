@@ -1975,7 +1975,7 @@ def dispatch_command(cmd: str) -> None:
     elif cmd == "backend":
         # Opt-in/out of the Neo4j source-of-truth backend for this project.
         # Config lives in <out>/backend.json (no credentials — the password
-        # stays in NEO4J_PASSWORD / GRAPHIFY_NEO4J_PASSWORD, F-031).
+        # stays in GRAPHIFY_NEO4J_PASSWORD (or legacy NEO4J_PASSWORD), F-031).
         from graphify.backends import (
             BACKEND_CONFIG_NAME,
             backend_config,
@@ -2468,7 +2468,7 @@ def dispatch_command(cmd: str) -> None:
             print("  svg       [--graph PATH] [--labels PATH]", file=sys.stderr)
             print("  graphml   [--graph PATH]", file=sys.stderr)
             print("  neo4j     [--graph PATH] [--push URI] [--user U] [--password P]", file=sys.stderr)
-            print("            (or set NEO4J_PASSWORD instead of --password to keep it off argv)", file=sys.stderr)
+            print("            (or set GRAPHIFY_NEO4J_PASSWORD instead of --password to keep it off argv)", file=sys.stderr)
             print("  falkordb  [--graph PATH] [--push URI] [--user U] [--password P]", file=sys.stderr)
             print("            (or set FALKORDB_PASSWORD instead of --password to keep it off argv)", file=sys.stderr)
             sys.exit(1)
@@ -2498,11 +2498,12 @@ def dispatch_command(cmd: str) -> None:
         push_user = "neo4j"  # Neo4j default user; FalkorDB auth is optional and ignores it
         # F-031: prefer an env var so the password never appears on argv (visible
         # in `ps` output / shell history). The explicit --password flag still
-        # overrides it. Each sink reads its own var: FALKORDB_PASSWORD for falkordb,
-        # NEO4J_PASSWORD otherwise.
+        # overrides it. Each sink reads its own var: FALKORDB_PASSWORD for
+        # falkordb, GRAPHIFY_NEO4J_PASSWORD (legacy NEO4J_PASSWORD) otherwise.
         push_password: str | None = (
             os.environ.get("FALKORDB_PASSWORD") if subcmd == "falkordb"
-            else os.environ.get("NEO4J_PASSWORD")
+            else os.environ.get("GRAPHIFY_NEO4J_PASSWORD")
+            or os.environ.get("NEO4J_PASSWORD")
         ) or None
         i = 0
         while i < len(args):

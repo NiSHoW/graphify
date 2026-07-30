@@ -491,7 +491,7 @@ By default graphify stores the graph in `graphify-out/graph.json` and Neo4j is j
 
 ```bash
 pip install "graphifyy[neo4j]"
-export NEO4J_PASSWORD=...              # never on argv, never in config files
+export GRAPHIFY_NEO4J_PASSWORD=...     # never on argv, never in config files
 graphify backend set neo4j://localhost:7687   # verifies connectivity, writes graphify-out/backend.json
 graphify extract .                     # builds and seeds the current git branch in Neo4j
 graphify update                        # incremental: pushes only the delta, in one transaction
@@ -510,7 +510,7 @@ How it works:
 - **Large graphs.** Pushes over ~2000 rows report progress on stderr. The push is one transaction by default; set `GRAPHIFY_NEO4J_TX_ROWS=<n>` to commit every ~n rows (easier on the Neo4j heap for big initial seeds) — reader consistency is preserved either way because the version bump is always the last statement of the last transaction.
 - **Round-trip schema.** Nodes carry `:GraphifyNode` plus a label derived from `file_type`; original `relation`/`file_type` strings, hyperedges and `built_at_commit` are preserved as properties/metadata, so what you read back equals what was written.
 
-Configuration: `graphify backend set` (writes `backend.json`, no credentials) or the `GRAPHIFY_NEO4J_URI` / `GRAPHIFY_NEO4J_USER` / `GRAPHIFY_NEO4J_DATABASE` env vars; the password comes only from `NEO4J_PASSWORD` (or `GRAPHIFY_NEO4J_PASSWORD`).
+Configuration: `graphify backend set` (writes `backend.json`, no credentials) or the `GRAPHIFY_NEO4J_URI` / `GRAPHIFY_NEO4J_USER` / `GRAPHIFY_NEO4J_DATABASE` env vars; the password comes only from `GRAPHIFY_NEO4J_PASSWORD` (or the generic `NEO4J_PASSWORD` as fallback).
 
 Known limits: community labels and the work-memory overlay (`.graphify_labels.json`, `.graphify_learning.json`) stay local files, so other machines sharing the DB see the graph but not this machine's annotations; concurrent writers on the same branch from different machines are last-write-wins.
 

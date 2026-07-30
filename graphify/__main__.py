@@ -540,7 +540,7 @@ def _run_cli() -> None:
         print("                            (also: GRAPHIFY_FORCE=1 env var; use after refactors that delete code)")
         print("    --no-cluster            skip clustering, write raw extraction only")
         print("  backend set <uri>       opt into Neo4j as the graph's source of truth (neo4j://host:7687[/db])")
-        print("    --user U                Neo4j user (default neo4j); password via NEO4J_PASSWORD env")
+        print("    --user U                Neo4j user (default neo4j); password via GRAPHIFY_NEO4J_PASSWORD env")
         print("    --database D            Neo4j database (default neo4j, or from the URI path)")
         print("  backend pull            materialize the current branch's graph from Neo4j into graphify-out/graph.json (no extraction)")
         print("  backend push            push the local graph.json cache to Neo4j (delta; for flows that wrote graph.json outside `graphify update`)")
