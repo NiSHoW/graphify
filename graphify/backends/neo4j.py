@@ -64,8 +64,16 @@ def safe_label(label: str) -> str:
 
 def node_uid(branch: str, node_id: str) -> str:
     # \x00 cannot appear in a git branch name or a graphify node id, so the
-    # composite key is unambiguous.
+    # composite key is unambiguous. ``branch`` may itself be a project-scoped
+    # key ("project\x00branch", see backends.scope_branch) — the uid then has
+    # three segments, still unambiguous because ids never contain \x00.
     return f"{branch}\x00{node_id}"
+
+
+def _branch_label(branch: str) -> str:
+    """Branch key as shown in messages: the \\x00 project separator (see
+    backends.scope_branch) renders as ':' (git forbids ':' in branch names)."""
+    return branch.replace("\x00", ":")
 
 
 def _split_props(attrs: dict) -> tuple[dict, str | None]:
@@ -227,7 +235,7 @@ class _PushProgress:
         self._tty = self.enabled and sys.stderr.isatty()
         if self.enabled:
             print(f"[graphify] Neo4j: pushing {total_rows:_d} rows to branch "
-                  f"{branch!r} ({mode})...", file=sys.stderr, flush=True)
+                  f"{_branch_label(branch)!r} ({mode})...", file=sys.stderr, flush=True)
 
     def _line(self) -> str:
         pct = self.done * 100 // self.total if self.total else 100
@@ -330,13 +338,13 @@ class Neo4jBackend:
             cap_nodes = max(1, _max_graph_file_bytes() // 1024)
             if node_count > cap_nodes:
                 raise ValueError(
-                    f"graph for branch {self.branch!r} has {node_count:_d} nodes, "
+                    f"graph for branch {_branch_label(self.branch)!r} has {node_count:_d} nodes, "
                     f"exceeds the {cap_nodes:_d}-node cap (derived from the graph "
                     f"byte cap; set GRAPHIFY_MAX_GRAPH_BYTES to raise it)"
                 )
             if node_count >= _PROGRESS_MIN_ROWS:
                 print(f"[graphify] Neo4j: loading {node_count:_d} nodes from "
-                      f"branch {self.branch!r}...", file=sys.stderr, flush=True)
+                      f"branch {_branch_label(self.branch)!r}...", file=sys.stderr, flush=True)
             node_recs = [dict(r["p"]) for r in session.run(
                 "MATCH (n:GraphifyNode {branch: $branch}) RETURN properties(n) AS p",
                 branch=self.branch,

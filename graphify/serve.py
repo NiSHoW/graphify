@@ -94,7 +94,7 @@ def _load_backend_ctx(path: str, *, cfg, out_dir: "Path | None",
     directly testable; ``_build_server`` passes its per-server cache in.
     """
     import time
-    from graphify.backends import current_branch, open_backend
+    from graphify.backends import current_branch, open_backend, scope_branch
     now = time.monotonic()
     ent = cache.get(path)
     if ent is not None and now - ent.get("last_poll", 0.0) < ttl:
@@ -105,14 +105,16 @@ def _load_backend_ctx(path: str, *, cfg, out_dir: "Path | None",
         if ent is not None and now - ent.get("last_poll", 0.0) < ttl:
             return ent["G"], ent["communities"]  # another thread polled
         # Re-detect the branch on every poll so a checkout under a running
-        # server re-scopes its queries within one TTL.
+        # server re-scopes its queries within one TTL. scope_branch keeps the
+        # project namespace that open_backend applied — a bare assignment here
+        # would silently drop it and read another project's graph.
         repo_root = out_dir.parent if out_dir is not None else None
-        branch = current_branch(repo_root)
+        branch = scope_branch(cfg, current_branch(repo_root))
         try:
             backend = ent.get("backend") if ent else None
             if backend is None:
                 backend = open_backend(cfg if cfg is not None else path,
-                                       out_dir=out_dir, branch=branch)
+                                       out_dir=out_dir, branch=None)
             backend.branch = branch
             version = backend.get_version()
         except Exception as exc:

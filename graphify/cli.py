@@ -1991,6 +1991,7 @@ def dispatch_command(cmd: str) -> None:
             uri: str | None = None
             user: str | None = None
             database: str | None = None
+            project: str | None = None
             i = 0
             while i < len(args):
                 if args[i] == "--user" and i + 1 < len(args):
@@ -1998,6 +1999,9 @@ def dispatch_command(cmd: str) -> None:
                     i += 2
                 elif args[i] == "--database" and i + 1 < len(args):
                     database = args[i + 1]
+                    i += 2
+                elif args[i] == "--project" and i + 1 < len(args):
+                    project = args[i + 1]
                     i += 2
                 elif args[i].startswith("-"):
                     print(f"error: unknown backend set option: {args[i]}", file=sys.stderr)
@@ -2007,7 +2011,10 @@ def dispatch_command(cmd: str) -> None:
                     i += 1
             if not uri:
                 print("Usage: graphify backend set neo4j://host:7687[/database] "
-                      "[--user U] [--database D]", file=sys.stderr)
+                      "[--user U] [--database D] [--project P]", file=sys.stderr)
+                sys.exit(2)
+            if project is not None and (not project.strip() or "\x00" in project):
+                print("error: --project must be a non-empty name", file=sys.stderr)
                 sys.exit(2)
             try:
                 cfg = parse_backend_uri(uri)
@@ -2018,6 +2025,12 @@ def dispatch_command(cmd: str) -> None:
                 cfg["user"] = user
             if database:
                 cfg["database"] = database
+            if project:
+                # Namespace for databases shared by multiple repos: same-named
+                # branches of different projects stop colliding (see
+                # backends.scope_branch). Persisted in backend.json so every
+                # clone of this repo lands in the same namespace.
+                cfg["project"] = project.strip()
             try:
                 b = open_backend(cfg, branch="_default")
                 b.ensure_schema()
@@ -2034,7 +2047,8 @@ def dispatch_command(cmd: str) -> None:
             ensure_out_gitignore(out_dir)
             from graphify.paths import write_json_atomic
             write_json_atomic(cfg_path, cfg, indent=2)
-            print(f"Neo4j backend configured: {cfg['uri']} (database {cfg['database']}, user {cfg['user']})")
+            _proj_note = f", project {cfg['project']}" if cfg.get("project") else ""
+            print(f"Neo4j backend configured: {cfg['uri']} (database {cfg['database']}, user {cfg['user']}{_proj_note})")
             print(f"Config written to {cfg_path}; graph.json in that directory is now a local cache.")
             print(f"Tip: commit {cfg_path} to share backend mode with the team — "
                   f"a fresh clone then auto-materializes from Neo4j on first query "
@@ -2082,7 +2096,8 @@ def dispatch_command(cmd: str) -> None:
                           f"Neo4j backend — run a build first (graphify update .)", file=sys.stderr)
                     sys.exit(1)
                 save_backend_state(out_dir, version=b.get_version())
-                print(f"Materialized branch {b.branch!r} into {out_dir / 'graph.json'} "
+                from graphify.backends import display_branch
+                print(f"Materialized branch {display_branch(b.branch)!r} into {out_dir / 'graph.json'} "
                       f"({len(data.get('nodes', []))} nodes, "
                       f"{len(data.get('links', data.get('edges', [])))} edges).")
             except Exception as exc:
@@ -2113,11 +2128,12 @@ def dispatch_command(cmd: str) -> None:
             try:
                 prior = b.load_graph_data()  # None => branch never written: full seed
                 counts = push_after_write(out_dir, b, prior=prior)
+                from graphify.backends import display_branch
                 if prior is None:
-                    print(f"Seeded branch {b.branch!r} with {counts['nodes']} nodes / "
+                    print(f"Seeded branch {display_branch(b.branch)!r} with {counts['nodes']} nodes / "
                           f"{counts['edges']} edges.")
                 else:
-                    print(f"Branch {b.branch!r} updated "
+                    print(f"Branch {display_branch(b.branch)!r} updated "
                           f"(+{counts['nodes_upserted']} nodes, +{counts['edges_upserted']} edges, "
                           f"-{counts['nodes_removed']} nodes, -{counts['edges_removed']} edges).")
             except Exception as exc:
@@ -2130,8 +2146,18 @@ def dispatch_command(cmd: str) -> None:
             sys.exit(2)
 
     elif cmd == "branches":
-        # List/manage per-branch graphs stored in the Neo4j backend.
-        from graphify.backends import backend_config, current_branch, open_backend
+        # List/manage per-branch graphs stored in the Neo4j backend. Everything
+        # is confined to this repo's project namespace (backends.scope_branch):
+        # other projects sharing the database are counted but never listed,
+        # deleted or pruned from here.
+        from graphify.backends import (
+            backend_config,
+            current_branch,
+            effective_project,
+            open_backend,
+            scope_branch,
+            split_scoped_branch,
+        )
         cfg = backend_config(Path(_GRAPHIFY_OUT))
         if cfg is None:
             print("error: no Neo4j backend configured (run: graphify backend set <uri>)", file=sys.stderr)
@@ -2155,9 +2181,10 @@ def dispatch_command(cmd: str) -> None:
         except (ImportError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(1)
+        project = effective_project(cfg)
         try:
             if delete_name:
-                res = b.delete_branch(delete_name)
+                res = b.delete_branch(scope_branch(cfg, delete_name))
                 if res.get("meta"):
                     print(f"Deleted branch {delete_name!r} ({res['nodes']} nodes).")
                 else:
@@ -2177,27 +2204,40 @@ def dispatch_command(cmd: str) -> None:
                 cur = current_branch()
                 pruned = 0
                 for meta in b.list_branches():
-                    name = meta.get("branch", "")
+                    key = meta.get("branch", "")
+                    meta_project, name = split_scoped_branch(key)
+                    if meta_project != project:
+                        continue  # another project's namespace: never prune across projects
                     if name == "_default" or name == cur or name in local:
                         continue
-                    res = b.delete_branch(name)
+                    res = b.delete_branch(key)
                     print(f"Pruned branch {name!r} ({res['nodes']} nodes).")
                     pruned += 1
                 if not pruned:
                     print("Nothing to prune: every backend branch matches a local git branch.")
             else:
                 metas = b.list_branches()
-                if not metas:
-                    print("No branches in the backend yet — run a build to seed one.")
+                mine = []
+                others = 0
+                for meta in metas:
+                    meta_project, name = split_scoped_branch(meta.get("branch", "?"))
+                    if meta_project == project:
+                        mine.append((name, meta))
+                    else:
+                        others += 1
+                if not mine:
+                    scope = f" for project {project!r}" if project else ""
+                    print(f"No branches in the backend{scope} yet — run a build to seed one.")
                 else:
                     cur = current_branch()
-                    for meta in metas:
-                        name = meta.get("branch", "?")
+                    for name, meta in mine:
                         marker = "*" if name == cur else " "
                         print(f"{marker} {name}  v{meta.get('version', '?')}  "
                               f"{meta.get('node_count', '?')} nodes / {meta.get('edge_count', '?')} edges  "
                               f"commit {str(meta.get('built_at_commit', ''))[:7] or '-'}  "
                               f"updated {meta.get('updated_at', '-')}")
+                if others:
+                    print(f"({others} branch(es) belong to other projects in this database — not shown)")
         except Exception as exc:
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(1)
