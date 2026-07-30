@@ -8,6 +8,13 @@ generic ``NEO4J_PASSWORD`` accepted as fallback; same F-031 rationale as
 ``export neo4j --push``: keep secrets off argv and out of version-controllable
 files).
 
+Several repos can share one database (community edition = one DB) via the
+optional ``project`` namespace (``backend set --project``, or the
+``GRAPHIFY_NEO4J_PROJECT`` env): it is folded into the branch key by
+:func:`scope_branch`, so same-named branches of different projects never
+collide. Without a project the storage keys are byte-identical to the
+pre-project format — existing databases keep working unchanged.
+
 This module stays importable without the neo4j driver installed: the driver is
 touched only inside :func:`open_backend`.
 """
@@ -33,6 +40,52 @@ _REF_RE = re.compile(
 
 BACKEND_CONFIG_NAME = "backend.json"
 _STATE_NAME = ".graphify_backend_state.json"
+
+# Separator between the project namespace and the branch in the storage-side
+# branch key. \x00 cannot appear in a git branch name, a project name (rejected
+# at `backend set`), or a graphify node id, so the composite is unambiguous —
+# the same trick node_uid() already relies on.
+_PROJECT_SEP = "\x00"
+
+
+def effective_project(cfg: "dict | None") -> "str | None":
+    """Project namespace for databases shared by multiple repos.
+
+    ``GRAPHIFY_NEO4J_PROJECT`` env wins (per-machine override, mirroring how
+    ``GRAPHIFY_NEO4J_URI`` overrides a committed backend.json), then the
+    ``project`` field of the backend config. None = legacy single-project mode.
+    """
+    return os.environ.get("GRAPHIFY_NEO4J_PROJECT") or (cfg or {}).get("project") or None
+
+
+def scope_branch(cfg: "dict | None", branch: str) -> str:
+    """Compose the storage-side branch key for ``branch`` under ``cfg``.
+
+    With a project configured, branch ``main`` of project ``shop`` is stored
+    as ``shop\\x00main``: the project rides inside the existing branch/uid/meta
+    keys, so two repos sharing one database (community edition = one DB) can
+    both have a ``main`` without wiping each other's graph on every update.
+    No schema change; configs without a project keep the legacy unscoped key.
+    """
+    if _PROJECT_SEP in branch:
+        return branch  # already scoped: never double-prefix
+    project = effective_project(cfg)
+    return f"{project}{_PROJECT_SEP}{branch}" if project else branch
+
+
+def split_scoped_branch(name: str) -> "tuple[str | None, str]":
+    """Inverse of :func:`scope_branch`: ``('shop', 'main')`` or ``(None, 'main')``."""
+    if _PROJECT_SEP in name:
+        project, _, branch = name.partition(_PROJECT_SEP)
+        return project, branch
+    return None, name
+
+
+def display_branch(name: str) -> str:
+    """Human-readable form of a possibly scoped branch key (``shop:main``).
+    ``:`` is display-only and unambiguous — git forbids it in branch names."""
+    project, branch = split_scoped_branch(name)
+    return f"{project}:{branch}" if project else branch
 
 # Self-ignoring output dir (node_modules-style): the folder carries its own
 # .gitignore so the materialized graph.json cache never needs a repo-root
@@ -117,12 +170,15 @@ def backend_config(out_dir: "Path | str | None" = None) -> dict | None:
         return None
     if not isinstance(raw, dict) or raw.get("backend") != "neo4j" or not raw.get("uri"):
         return None
-    return {
+    cfg = {
         "backend": "neo4j",
         "uri": str(raw["uri"]),
         "user": str(raw.get("user") or "neo4j"),
         "database": str(raw.get("database") or "neo4j"),
     }
+    if raw.get("project"):
+        cfg["project"] = str(raw["project"])
+    return cfg
 
 
 def _resolve_password() -> str:
@@ -156,7 +212,10 @@ def open_backend(ref_or_cfg=None, *, branch: str | None = None,
         cfg.get("user", "neo4j"),
         _resolve_password(),
         database=cfg.get("database", "neo4j"),
-        branch=branch if branch is not None else current_branch(),
+        # The project namespace (multi-repo databases) rides inside the branch
+        # key, so every caller gets it for free — but anyone assigning
+        # backend.branch later must go through scope_branch() too (serve does).
+        branch=scope_branch(cfg, branch if branch is not None else current_branch()),
     )
 
 
@@ -404,7 +463,7 @@ class BackendSync:
             pass
         try:
             counts = push_after_write(self.out, self.backend, prior=self.prior)
-            branch = getattr(self.backend, "branch", "?")
+            branch = display_branch(getattr(self.backend, "branch", "?"))
             if self.prior is None:
                 print(f"[graphify] Neo4j: seeded branch {branch!r} with "
                       f"{counts['nodes']} nodes / {counts['edges']} edges.")

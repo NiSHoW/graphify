@@ -837,3 +837,64 @@ def test_cli_backend_push_delta(tmp_path, monkeypatch, capsys):
     assert any(n["id"] == "n3" for n in pushed_data["nodes"])
     from graphify.backends import load_backend_state
     assert load_backend_state(out)["version"] == fb.version
+
+
+# --- project namespace (multi-repo databases) ---
+
+def test_scope_branch_composition(monkeypatch):
+    from graphify.backends import (
+        display_branch,
+        effective_project,
+        scope_branch,
+        split_scoped_branch,
+    )
+    monkeypatch.delenv("GRAPHIFY_NEO4J_PROJECT", raising=False)
+    # legacy: no project -> storage key is the plain branch, byte-identical
+    assert scope_branch(None, "main") == "main"
+    assert scope_branch({"backend": "neo4j"}, "main") == "main"
+    assert scope_branch({"project": "shop"}, "main") == "shop\x00main"
+    # idempotent: an already-scoped key never gets a second prefix
+    assert scope_branch({"project": "shop"}, "shop\x00main") == "shop\x00main"
+    assert split_scoped_branch("shop\x00main") == ("shop", "main")
+    assert split_scoped_branch("main") == (None, "main")
+    assert display_branch("shop\x00main") == "shop:main"
+    assert display_branch("main") == "main"
+    # env override wins over the config (per-machine escape hatch)
+    monkeypatch.setenv("GRAPHIFY_NEO4J_PROJECT", "env-proj")
+    assert effective_project({"project": "shop"}) == "env-proj"
+    assert scope_branch(None, "main") == "env-proj\x00main"
+
+
+def test_backend_config_reads_project(tmp_path, monkeypatch):
+    monkeypatch.delenv("GRAPHIFY_NEO4J_URI", raising=False)
+    (tmp_path / "backend.json").write_text(json.dumps(
+        {"backend": "neo4j", "uri": "neo4j://h:7687", "project": "shop"}),
+        encoding="utf-8")
+    cfg = backend_config(tmp_path)
+    assert cfg["project"] == "shop"
+    # absent field -> no key, so effective_project() falls through to None
+    (tmp_path / "backend.json").write_text(json.dumps(
+        {"backend": "neo4j", "uri": "neo4j://h:7687"}), encoding="utf-8")
+    assert "project" not in backend_config(tmp_path)
+
+
+def test_open_backend_scopes_branch_with_project(fake_neo4j, monkeypatch):
+    from graphify.backends import open_backend
+    monkeypatch.delenv("GRAPHIFY_NEO4J_PROJECT", raising=False)
+    monkeypatch.setenv("GRAPHIFY_NEO4J_PASSWORD", "s3cret")
+    cfg = {"backend": "neo4j", "uri": "neo4j://localhost:7687",
+           "user": "neo4j", "database": "neo4j", "project": "shop"}
+    b = open_backend(cfg, branch="main")
+    assert b.branch == "shop\x00main"
+    # legacy config: unchanged key
+    legacy = {k: v for k, v in cfg.items() if k != "project"}
+    assert open_backend(legacy, branch="main").branch == "main"
+    # the collision the namespace exists to prevent: same branch name, two
+    # projects, one database -> distinct uids, so neither delta-prunes the other
+    b2 = open_backend(dict(cfg, project="crm"), branch="main")
+    uid_shop = _node_rows({"nodes": [{"id": "n1", "file_type": "code"}]},
+                          b.branch)["Code"][0]["uid"]
+    uid_crm = _node_rows({"nodes": [{"id": "n1", "file_type": "code"}]},
+                         b2.branch)["Code"][0]["uid"]
+    assert uid_shop != uid_crm
+    assert uid_shop == "shop\x00main\x00n1"

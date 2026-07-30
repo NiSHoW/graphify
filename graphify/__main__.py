@@ -542,6 +542,8 @@ def _run_cli() -> None:
         print("  backend set <uri>       opt into Neo4j as the graph's source of truth (neo4j://host:7687[/db])")
         print("    --user U                Neo4j user (default neo4j); password via GRAPHIFY_NEO4J_PASSWORD env")
         print("    --database D            Neo4j database (default neo4j, or from the URI path)")
+        print("    --project P             namespace when several repos share one database (community")
+        print("                            edition = one DB); same-named branches stop colliding")
         print("  backend pull            materialize the current branch's graph from Neo4j into graphify-out/graph.json (no extraction)")
         print("  backend push            push the local graph.json cache to Neo4j (delta; for flows that wrote graph.json outside `graphify update`)")
         print("  backend show|unset      show or remove the Neo4j backend config (backend.json)")
