@@ -2011,6 +2011,7 @@ def dispatch_command(cmd: str) -> None:
         from graphify.backends import (
             BACKEND_CONFIG_NAME,
             backend_config,
+            derive_project_from_git,
             ensure_out_gitignore,
             open_backend,
             parse_backend_uri,
@@ -2043,8 +2044,19 @@ def dispatch_command(cmd: str) -> None:
                     i += 1
             if not uri:
                 print("Usage: graphify backend set neo4j://host:7687[/database] "
-                      "[--user U] [--database D] [--project P]", file=sys.stderr)
+                      "[--user U] [--database D] [--project P|auto]", file=sys.stderr)
                 sys.exit(2)
+            if project is not None and project.strip().lower() == "auto":
+                # Derive the name from git ONCE and persist it below: the
+                # origin URL basename (same for every clone), else the repo
+                # dir name. Runtime derivation would move the storage keys
+                # whenever the remote is renamed or absent (CI tarballs).
+                project = derive_project_from_git()
+                if not project:
+                    print("error: --project auto could not derive a name from git "
+                          "(no origin remote and not inside a git repo); "
+                          "pass an explicit --project <name>", file=sys.stderr)
+                    sys.exit(2)
             if project is not None and (not project.strip() or "\x00" in project):
                 print("error: --project must be a non-empty name", file=sys.stderr)
                 sys.exit(2)

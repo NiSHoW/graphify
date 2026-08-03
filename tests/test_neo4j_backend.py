@@ -581,6 +581,9 @@ class _FakeSyncBackend:
                 "nodes_upserted": 0, "edges_upserted": 0,
                 "nodes_removed": 0, "edges_removed": 0}
 
+    def ensure_schema(self):
+        pass
+
     def close(self):
         self.closed = True
 
@@ -898,3 +901,70 @@ def test_open_backend_scopes_branch_with_project(fake_neo4j, monkeypatch):
                          b2.branch)["Code"][0]["uid"]
     assert uid_shop != uid_crm
     assert uid_shop == "shop\x00main\x00n1"
+
+
+# --- project auto-derivation from git (backend set --project auto) ---
+
+def _git_repo(path, *, origin=None):
+    import subprocess
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    if origin:
+        subprocess.run(["git", "remote", "add", "origin", origin], cwd=path, check=True)
+    return path
+
+
+def test_derive_project_from_https_remote(tmp_path):
+    from graphify.backends import derive_project_from_git
+    repo = _git_repo(tmp_path / "clone-dir", origin="https://github.com/acme/shop-api.git")
+    assert derive_project_from_git(repo) == "shop-api"
+
+
+def test_derive_project_from_scp_like_remote(tmp_path):
+    from graphify.backends import derive_project_from_git
+    repo = _git_repo(tmp_path / "clone-dir", origin="git@github.com:acme/shop-api.git")
+    assert derive_project_from_git(repo) == "shop-api"
+
+
+def test_derive_project_without_remote_falls_back_to_repo_dir(tmp_path):
+    # the clone URL is the natural shared name, but a remote-less repo
+    # (git init, CI tarball + init) still gets a stable local default
+    from graphify.backends import derive_project_from_git
+    repo = _git_repo(tmp_path / "shop-api")
+    assert derive_project_from_git(repo) == "shop-api"
+
+
+def test_derive_project_outside_a_repo_is_none(tmp_path):
+    from graphify.backends import derive_project_from_git
+    lone = tmp_path / "not-a-repo"
+    lone.mkdir()
+    assert derive_project_from_git(lone) is None
+
+
+def test_cli_backend_set_project_auto_derives_from_origin(tmp_path, monkeypatch, capsys):
+    import graphify.backends as backends
+    from graphify import cli
+    repo = _git_repo(tmp_path / "clone-dir", origin="https://github.com/acme/shop-api.git")
+    fb = _FakeSyncBackend()
+    monkeypatch.setattr(backends, "open_backend", lambda *a, **kw: fb)
+    monkeypatch.delenv("GRAPHIFY_NEO4J_URI", raising=False)
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(sys, "argv", ["graphify", "backend", "set", "neo4j://h:7687",
+                                      "--project", "auto"])
+    cli.dispatch_command("backend")
+    cfg = json.loads((repo / "graphify-out" / "backend.json").read_text(encoding="utf-8"))
+    assert cfg["project"] == "shop-api"
+    assert "shop-api" in capsys.readouterr().out
+
+
+def test_cli_backend_set_project_auto_outside_git_fails(tmp_path, monkeypatch, capsys):
+    from graphify import cli
+    lone = tmp_path / "not-a-repo"
+    lone.mkdir()
+    monkeypatch.delenv("GRAPHIFY_NEO4J_URI", raising=False)
+    monkeypatch.chdir(lone)
+    monkeypatch.setattr(sys, "argv", ["graphify", "backend", "set", "neo4j://h:7687",
+                                      "--project", "auto"])
+    with pytest.raises(SystemExit):
+        cli.dispatch_command("backend")
+    assert "--project" in capsys.readouterr().err
