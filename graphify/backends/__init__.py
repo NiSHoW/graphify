@@ -219,6 +219,20 @@ def open_backend(ref_or_cfg=None, *, branch: str | None = None,
     )
 
 
+def _git(args: "list[str]", repo_root: "Path | str | None" = None) -> str | None:
+    try:
+        r = subprocess.run(
+            ["git", *args],
+            cwd=str(repo_root) if repo_root else None,
+            capture_output=True, text=True, timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip() or None
+
+
 def current_branch(repo_root: "Path | str | None" = None) -> str:
     """Git branch used to tag graph data in the backend.
 
@@ -229,27 +243,40 @@ def current_branch(repo_root: "Path | str | None" = None) -> str:
     env = os.environ.get("GRAPHIFY_BRANCH")
     if env:
         return env
-
-    def _git(*args: str) -> str | None:
-        try:
-            r = subprocess.run(
-                ["git", *args],
-                cwd=str(repo_root) if repo_root else None,
-                capture_output=True, text=True, timeout=3,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        if r.returncode != 0:
-            return None
-        return r.stdout.strip() or None
-
-    name = _git("rev-parse", "--abbrev-ref", "HEAD")
+    name = _git(["rev-parse", "--abbrev-ref", "HEAD"], repo_root)
     if not name:
         return "_default"
     if name == "HEAD":  # detached
-        sha = _git("rev-parse", "--short", "HEAD")
+        sha = _git(["rev-parse", "--short", "HEAD"], repo_root)
         return f"detached-{sha}" if sha else "_default"
     return name
+
+
+def derive_project_from_git(repo_root: "Path | str | None" = None) -> "str | None":
+    """Project name derived from git, for ``backend set --project auto``.
+
+    Basename of the ``origin`` remote URL (the URL the repo was cloned from,
+    so every clone derives the same name), falling back to the repo root
+    directory name for remote-less repos; None outside a git repo. Unlike the
+    branch this is derived ONCE at ``backend set`` and persisted in
+    backend.json — re-deriving at runtime would silently move the storage
+    keys on a remote rename or a checkout without remotes.
+    """
+    url = _git(["remote", "get-url", "origin"], repo_root)
+    if url:
+        # works for https://host/owner/repo.git, git@host:owner/repo.git,
+        # ssh://git@host/owner/repo — the name is the last path segment
+        tail = re.split(r"[/:]", url.rstrip("/"))[-1]
+        if tail.endswith(".git"):
+            tail = tail[: -len(".git")]
+        if tail.strip():
+            return tail.strip()
+    top = _git(["rev-parse", "--show-toplevel"], repo_root)
+    if top:
+        name = Path(top).name.strip()
+        if name:
+            return name
+    return None
 
 
 def load_graph_data_any(ref_or_path: str) -> tuple[dict, "Path | None"]:
