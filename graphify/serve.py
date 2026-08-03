@@ -910,6 +910,56 @@ def _filter_graph_by_context(G: nx.Graph, context_filters: list[str] | None) -> 
     return H
 
 
+def _complete_induced_edges(G: nx.Graph, visited: set[str], edges_seen: list[tuple]) -> None:
+    """Append edges between visited nodes that the traversal never recorded (#2323).
+
+    Both traversals only record an edge that *discovers* an unvisited neighbour,
+    so what they return is a traversal tree, not the induced subgraph over the
+    nodes they return. `_bfs` marks every seed visited up front, so an edge
+    between two seeds can never be recorded — the reported symptom, where both
+    endpoints render and the edge between them does not. It drops ordinary
+    cross-edges for the same reason. `_dfs` appends on push rather than on
+    visit, so it already captured those; its one gap is an edge between two
+    non-seed hubs, since neither endpoint is ever expanded.
+
+    Scans only edges incident to `visited`, so cost tracks the subgraph rather
+    than the whole graph, bounded by O(2E) overall. A visited hub is rescanned
+    in full even though the traversal deliberately did not expand it — that is
+    unavoidable, since a hub-to-hub edge is exactly the case `_dfs` misses.
+    `G` here is the context-filtered `traversal_graph` (see
+    `_query_graph_text`), so a filtered-out relation cannot reappear.
+
+    Self-loops are skipped. A recursive function legitimately carries one, but
+    neither traversal has ever recorded one (`n` is always already visited when
+    its own self-loop is examined), and surfacing them is a separate output
+    change from the missing edges reported here.
+
+    Dedup keys on the ordered pair for directed graphs and the unordered pair
+    otherwise: on a DiGraph `u->v` and `v->u` are genuinely distinct edges
+    (mutual recursion, circular imports), and collapsing them would drop a real
+    one. On a multigraph parallel edges collapse to one entry, matching the
+    renderer, which already shows only the first (`_subgraph_to_text`).
+
+    Traversal edges keep their discovery order; completions are appended after.
+    """
+    directed = G.is_directed()
+
+    def _key(u: str, v: str):
+        return (u, v) if directed else frozenset((u, v))
+
+    seen = {_key(u, v) for u, v in edges_seen}
+    # sorted() so the appended order can't shift run-to-run with CPython's
+    # per-process string-hash seed, the same reason the renderer sorts (#1753).
+    for u, v in G.edges(sorted(visited)):
+        if u == v or v not in visited:
+            continue
+        key = _key(u, v)
+        if key in seen:
+            continue
+        seen.add(key)
+        edges_seen.append((u, v))
+
+
 def _bfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], list[tuple]]:
     # Compute hub threshold: nodes above this degree are not expanded as transit.
     # p99 of degree distribution, floored at 50 to avoid over-blocking small graphs.
@@ -937,6 +987,7 @@ def _bfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
                     edges_seen.append((n, neighbor))
         visited.update(next_frontier)
         frontier = next_frontier
+    _complete_induced_edges(G, visited, edges_seen)
     return visited, edges_seen
 
 
@@ -963,6 +1014,7 @@ def _dfs(G: nx.Graph, start_nodes: list[str], depth: int) -> tuple[set[str], lis
             if neighbor not in visited:
                 stack.append((neighbor, d + 1))
                 edges_seen.append((node, neighbor))
+    _complete_induced_edges(G, visited, edges_seen)
     return visited, edges_seen
 
 
@@ -1158,12 +1210,15 @@ def _query_graph_text(
     return header + _subgraph_to_text(traversal_graph, nodes, edges, token_budget, seeds=start_nodes)
 
 
-def _find_node(G: nx.Graph, label: str) -> list[str]:
-    """Return node IDs whose label or ID matches the search term (diacritic-insensitive).
+def _find_node_tiers(
+    G: nx.Graph, label: str
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """Return match tiers in precedence order: (source_exact, exact, prefix, substring).
 
-    Results are ordered by precedence: exact source-file path match first, then
-    exact (label/ID) match, then prefix match, then substring match. Node-ID exact
-    matches are grouped with label exact matches.
+    Split out of `_find_node` so callers that must not guess between equally-good
+    matches can inspect the winning tier alone. `_find_node` flattens these, and
+    its consumers take `[0]` — which resolves by graph-iteration order when one
+    tier holds several nodes from different files. See `find_node_ambiguity`.
     """
     term = " ".join(_search_tokens(label))
     if not term:
@@ -1225,7 +1280,45 @@ def _find_node(G: nx.Graph, label: str) -> list[str]:
         if len(preferred) == 1:
             source_exact = preferred + [nid for nid in source_exact if nid != preferred[0]]
 
+    return source_exact, exact, prefix, substring
+
+
+def _find_node(G: nx.Graph, label: str) -> list[str]:
+    """Return node IDs whose label or ID matches the search term (diacritic-insensitive).
+
+    Results are ordered by precedence: exact source-file path match first, then
+    exact (label/ID) match, then prefix match, then substring match. Node-ID exact
+    matches are grouped with label exact matches.
+    """
+    source_exact, exact, prefix, substring = _find_node_tiers(G, label)
     return source_exact + exact + prefix + substring
+
+
+def find_node_ambiguity(G: nx.Graph, label: str) -> list[str]:
+    """Return rival candidates when the winning match tier spans several source files.
+
+    `_find_node` ranks matches but never reports that a tie was broken, so callers
+    taking `[0]` present one arbitrary file as the answer. Two workspaces that each
+    define `MetricsPort` put both nodes in the same `exact` tier, separated only by
+    `G.nodes()` iteration order — reorder the graph and the same query answers with
+    a different file, equally confidently.
+
+    Returns one representative node id per distinct source file when the winning
+    tier is split that way, else `[]`. Several matches *within one file* (a file
+    node plus its members) are ordinary precedence, not ambiguity, and return `[]`.
+
+    `_disambiguate_file_node_labels` (#2032) already relabels colliding *file*
+    nodes; this covers the symbol case it does not reach.
+    """
+    for tier in _find_node_tiers(G, label):
+        if not tier:
+            continue
+        by_source: dict[str, str] = {}
+        for nid in tier:
+            source = str(G.nodes[nid].get("source_file") or "")
+            by_source.setdefault(source, nid)
+        return list(by_source.values()) if len(by_source) > 1 else []
+    return []
 
 
 def _filter_blank_stdin() -> None:
@@ -1570,6 +1663,16 @@ def _build_server(graph_path: str):
         matches = _find_node(G, label)
         if not matches:
             return f"No node matching '{label}' found."
+        rivals = find_node_ambiguity(G, label)
+        if rivals:
+            listing = "\n".join(
+                f"  {G.nodes[r].get('source_file') or r}\n    id: {r}" for r in rivals
+            )
+            return (
+                f"Ambiguous: '{label}' matches {len(rivals)} nodes in different files.\n"
+                f"{listing}\n"
+                "Retry with the repo-relative path or the full node id."
+            )
         nid = matches[0]
         lines = [f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"]
         def _edge_at(d: dict) -> str:
